@@ -37,19 +37,45 @@ impl Cpu {
         byte
     }
 
-    pub fn step(&mut self, bus: &mut impl Bus) {
+    pub fn step(&mut self, bus: &mut impl Bus) -> u8 {
         if self.halted {
-            return;
+            return 4;
         }
 
         let opcode = self.fetch8(bus);
         match opcode {
-            0x00 => {}
+            0x00 => 4,
+            0x06 => {
+                self.b = self.fetch8(bus);
+                8
+            }
+            0x0e => {
+                self.c = self.fetch8(bus);
+                8
+            }
+            0x16 => {
+                self.d = self.fetch8(bus);
+                8
+            }
+            0x1e => {
+                self.e = self.fetch8(bus);
+                8
+            }
+            0x26 => {
+                self.h = self.fetch8(bus);
+                8
+            }
+            0x2e => {
+                self.l = self.fetch8(bus);
+                8
+            }
             0x3e => {
                 self.a = self.fetch8(bus);
+                8
             }
             0x76 => {
                 self.halted = true;
+                4
             }
             _ => panic!("unimplemented opcode: {:#04x}", opcode),
         }
@@ -106,8 +132,21 @@ mod tests {
         let pc = cpu.pc;
         assert!(cpu.halted);
 
-        cpu.step(&mut mem);
+        let cycles = cpu.step(&mut mem);
         assert_eq!(cpu.pc, pc);
+        assert_eq!(cycles, 4);
+    }
+
+    #[test]
+    fn step_returns_cycle_counts() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        mem.load(0x0000, &[0x00, 0x3e, 0x42, 0x76]);
+
+        assert_eq!(cpu.step(&mut mem), 4); // NOP
+        assert_eq!(cpu.step(&mut mem), 8); // LD A, n
+        assert_eq!(cpu.step(&mut mem), 4); // HALT
+        assert_eq!(cpu.step(&mut mem), 4); // halted -> 1 M-cycle
     }
 
     #[test]
@@ -120,6 +159,39 @@ mod tests {
         cpu.step(&mut mem);
 
         assert_eq!(cpu.pc, 0x0000);
+    }
+
+    #[test]
+    fn ld_r_n_loads_all_8bit_registers() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        mem.load(
+            0x0000,
+            &[
+                0x06, 0xb0, // LD B, 0xB0
+                0x0e, 0xc0, // LD C, 0xC0
+                0x16, 0xd0, // LD D, 0xD0
+                0x1e, 0xe0, // LD E, 0xE0
+                0x26, 0x40, // LD H, 0x40
+                0x2e, 0x50, // LD L, 0x50
+                0x3e, 0xa0, // LD A, 0xA0
+                0x76,       // HALT
+            ],
+        );
+
+        for _ in 0..8 {
+            cpu.step(&mut mem);
+        }
+
+        assert_eq!(cpu.b, 0xb0);
+        assert_eq!(cpu.c, 0xc0);
+        assert_eq!(cpu.d, 0xd0);
+        assert_eq!(cpu.e, 0xe0);
+        assert_eq!(cpu.h, 0x40);
+        assert_eq!(cpu.l, 0x50);
+        assert_eq!(cpu.a, 0xa0);
+        assert!(cpu.halted);
+        assert_eq!(cpu.pc, 0x000f);
     }
 
     #[test]
