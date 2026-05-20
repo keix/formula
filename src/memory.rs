@@ -55,4 +55,32 @@ mod tests {
         assert_eq!(mem.read8(0x0001), 0x42);
         assert_eq!(mem.read8(0x0002), 0x76);
     }
+
+    #[test]
+    fn uninitialized_memory_reads_zero() {
+        let mem = Memory::new();
+
+        assert_eq!(mem.read8(0x0000), 0x00);
+        assert_eq!(mem.read8(0x1234), 0x00);
+        assert_eq!(mem.read8(0xffff), 0x00);
+    }
+
+    #[test]
+    fn load_at_high_boundary() {
+        let mut mem = Memory::new();
+
+        mem.load(0xfffe, &[0xab, 0xcd]);
+
+        assert_eq!(mem.read8(0xfffe), 0xab);
+        assert_eq!(mem.read8(0xffff), 0xcd);
+    }
+
+    #[test]
+    fn write_at_high_boundary() {
+        let mut mem = Memory::new();
+
+        mem.write8(0xffff, 0x7f);
+
+        assert_eq!(mem.read8(0xffff), 0x7f);
+    }
 }
