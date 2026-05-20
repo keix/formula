@@ -31,10 +31,62 @@ impl Cpu {
         }
     }
 
+    pub fn bc(&self) -> u16 {
+        u16::from_be_bytes([self.b, self.c])
+    }
+
+    pub fn de(&self) -> u16 {
+        u16::from_be_bytes([self.d, self.e])
+    }
+
+    pub fn hl(&self) -> u16 {
+        u16::from_be_bytes([self.h, self.l])
+    }
+
+    pub fn set_bc(&mut self, value: u16) {
+        [self.b, self.c] = value.to_be_bytes();
+    }
+
+    pub fn set_de(&mut self, value: u16) {
+        [self.d, self.e] = value.to_be_bytes();
+    }
+
+    pub fn set_hl(&mut self, value: u16) {
+        [self.h, self.l] = value.to_be_bytes();
+    }
+
     fn fetch8(&mut self, bus: &mut impl Bus) -> u8 {
         let byte = bus.read8(self.pc);
         self.pc = self.pc.wrapping_add(1);
         byte
+    }
+
+    fn read_r(&self, idx: u8, bus: &impl Bus) -> u8 {
+        match idx & 7 {
+            0 => self.b,
+            1 => self.c,
+            2 => self.d,
+            3 => self.e,
+            4 => self.h,
+            5 => self.l,
+            6 => bus.read8(self.hl()),
+            7 => self.a,
+            _ => unreachable!(),
+        }
+    }
+
+    fn write_r(&mut self, idx: u8, value: u8, bus: &mut impl Bus) {
+        match idx & 7 {
+            0 => self.b = value,
+            1 => self.c = value,
+            2 => self.d = value,
+            3 => self.e = value,
+            4 => self.h = value,
+            5 => self.l = value,
+            6 => bus.write8(self.hl(), value),
+            7 => self.a = value,
+            _ => unreachable!(),
+        }
     }
 
     pub fn step(&mut self, bus: &mut impl Bus) -> u8 {
@@ -76,6 +128,13 @@ impl Cpu {
             0x76 => {
                 self.halted = true;
                 4
+            }
+            0x40..=0x7f => {
+                let dst = (opcode >> 3) & 7;
+                let src = opcode & 7;
+                let value = self.read_r(src, bus);
+                self.write_r(dst, value, bus);
+                if dst == 6 || src == 6 { 8 } else { 4 }
             }
             _ => panic!("unimplemented opcode: {:#04x}", opcode),
         }
@@ -216,5 +275,110 @@ mod tests {
         mem.load(0x0000, &[0xff]);
 
         cpu.step(&mut mem);
+    }
+
+    #[test]
+    fn register_pairs_roundtrip() {
+        let mut cpu = Cpu::new();
+
+        cpu.set_bc(0x1234);
+        assert_eq!((cpu.b, cpu.c), (0x12, 0x34));
+        assert_eq!(cpu.bc(), 0x1234);
+
+        cpu.set_de(0x5678);
+        assert_eq!((cpu.d, cpu.e), (0x56, 0x78));
+        assert_eq!(cpu.de(), 0x5678);
+
+        cpu.set_hl(0x9abc);
+        assert_eq!((cpu.h, cpu.l), (0x9a, 0xbc));
+        assert_eq!(cpu.hl(), 0x9abc);
+    }
+
+    #[test]
+    fn read_r_dispatches_to_all_registers() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.b = 0xb0;
+        cpu.c = 0xc0;
+        cpu.d = 0xd0;
+        cpu.e = 0xe0;
+        cpu.set_hl(0x4050);
+        cpu.a = 0xa0;
+        mem.write8(0x4050, 0x66);
+
+        assert_eq!(cpu.read_r(0, &mem), 0xb0); // B
+        assert_eq!(cpu.read_r(1, &mem), 0xc0); // C
+        assert_eq!(cpu.read_r(2, &mem), 0xd0); // D
+        assert_eq!(cpu.read_r(3, &mem), 0xe0); // E
+        assert_eq!(cpu.read_r(4, &mem), 0x40); // H
+        assert_eq!(cpu.read_r(5, &mem), 0x50); // L
+        assert_eq!(cpu.read_r(6, &mem), 0x66); // (HL)
+        assert_eq!(cpu.read_r(7, &mem), 0xa0); // A
+    }
+
+    #[test]
+    fn ld_b_c() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.c = 0x42;
+        mem.load(0x0000, &[0x41]); // LD B, C
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cpu.b, 0x42);
+        assert_eq!(cycles, 4);
+    }
+
+    #[test]
+    fn ld_a_indirect_hl() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_hl(0xc000);
+        mem.write8(0xc000, 0x99);
+        mem.load(0x0000, &[0x7e]); // LD A, (HL)
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0x99);
+        assert_eq!(cycles, 8);
+    }
+
+    #[test]
+    fn ld_indirect_hl_a() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_hl(0xc000);
+        cpu.a = 0x88;
+        mem.load(0x0000, &[0x77]); // LD (HL), A
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(mem.read8(0xc000), 0x88);
+        assert_eq!(cycles, 8);
+    }
+
+    #[test]
+    fn write_r_dispatches_to_all_registers() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_hl(0xc000);
+
+        cpu.write_r(6, 0x66, &mut mem); // (HL) before H/L get overwritten
+        cpu.write_r(0, 0xb0, &mut mem);
+        cpu.write_r(1, 0xc0, &mut mem);
+        cpu.write_r(2, 0xd0, &mut mem);
+        cpu.write_r(3, 0xe0, &mut mem);
+        cpu.write_r(4, 0x40, &mut mem);
+        cpu.write_r(5, 0x50, &mut mem);
+        cpu.write_r(7, 0xa0, &mut mem);
+
+        assert_eq!(cpu.b, 0xb0);
+        assert_eq!(cpu.c, 0xc0);
+        assert_eq!(cpu.d, 0xd0);
+        assert_eq!(cpu.e, 0xe0);
+        assert_eq!(cpu.h, 0x40);
+        assert_eq!(cpu.l, 0x50);
+        assert_eq!(cpu.a, 0xa0);
+        assert_eq!(mem.read8(0xc000), 0x66);
     }
 }
