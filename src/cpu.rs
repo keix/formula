@@ -1,8 +1,9 @@
 use crate::bus::Bus;
+use crate::flags::Flags;
 
 pub struct Cpu {
     pub a: u8,
-    pub f: u8,
+    pub f: Flags,
     pub b: u8,
     pub c: u8,
     pub d: u8,
@@ -18,7 +19,7 @@ impl Cpu {
     pub fn new() -> Self {
         Self {
             a: 0,
-            f: 0,
+            f: Flags::default(),
             b: 0,
             c: 0,
             d: 0,
@@ -29,6 +30,16 @@ impl Cpu {
             pc: 0,
             halted: false,
         }
+    }
+
+    pub fn af(&self) -> u16 {
+        u16::from_be_bytes([self.a, self.f.bits()])
+    }
+
+    pub fn set_af(&mut self, value: u16) {
+        let [hi, lo] = value.to_be_bytes();
+        self.a = hi;
+        self.f = Flags::from_bits(lo);
     }
 
     pub fn bc(&self) -> u16 {
@@ -292,6 +303,17 @@ mod tests {
         cpu.set_hl(0x9abc);
         assert_eq!((cpu.h, cpu.l), (0x9a, 0xbc));
         assert_eq!(cpu.hl(), 0x9abc);
+    }
+
+    #[test]
+    fn set_af_masks_lower_nibble_of_f() {
+        let mut cpu = Cpu::new();
+
+        cpu.set_af(0x12ff);
+
+        assert_eq!(cpu.a, 0x12);
+        assert_eq!(cpu.f.bits(), 0xf0);
+        assert_eq!(cpu.af(), 0x12f0);
     }
 
     #[test]
