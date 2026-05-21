@@ -231,6 +231,47 @@ impl Cpu {
         if idx == 6 { 12 } else { 4 }
     }
 
+    fn add_hl(&mut self, value: u16) {
+        let hl = self.hl();
+        let (result, carry) = hl.overflowing_add(value);
+        let half = ((hl & 0x0fff) + (value & 0x0fff)) > 0x0fff;
+        self.set_hl(result);
+        // Z preserved
+        self.f.set_n(false);
+        self.f.set_h(half);
+        self.f.set_c(carry);
+    }
+
+    fn cc_satisfied(&self, cc: u8) -> bool {
+        match cc & 3 {
+            0 => !self.f.z(), // NZ
+            1 => self.f.z(),  // Z
+            2 => !self.f.c(), // NC
+            3 => self.f.c(),  // C
+            _ => unreachable!(),
+        }
+    }
+
+    fn jr_cc(&mut self, cc: u8, bus: &mut impl Bus) -> u8 {
+        let e = self.fetch8(bus) as i8;
+        if self.cc_satisfied(cc) {
+            self.pc = self.pc.wrapping_add_signed(i16::from(e));
+            12
+        } else {
+            8
+        }
+    }
+
+    fn jp_cc(&mut self, cc: u8, bus: &mut impl Bus) -> u8 {
+        let nn = self.fetch16(bus);
+        if self.cc_satisfied(cc) {
+            self.pc = nn;
+            16
+        } else {
+            12
+        }
+    }
+
     fn rlc(&mut self, value: u8) -> u8 {
         let result = value.rotate_left(1);
         self.f.set_z(result == 0);
@@ -419,6 +460,10 @@ impl Cpu {
                 self.set_bc(v);
                 12
             }
+            0x02 => {
+                bus.write8(self.bc(), self.a);
+                8
+            }
             0x03 => {
                 self.set_bc(self.bc().wrapping_add(1));
                 8
@@ -433,6 +478,14 @@ impl Cpu {
                 self.a = self.rlc(self.a);
                 self.f.set_z(false);
                 4
+            }
+            0x09 => {
+                self.add_hl(self.bc());
+                8
+            }
+            0x0a => {
+                self.a = bus.read8(self.bc());
+                8
             }
             0x0b => {
                 self.set_bc(self.bc().wrapping_sub(1));
@@ -454,6 +507,10 @@ impl Cpu {
                 self.set_de(v);
                 12
             }
+            0x12 => {
+                bus.write8(self.de(), self.a);
+                8
+            }
             0x13 => {
                 self.set_de(self.de().wrapping_add(1));
                 8
@@ -468,6 +525,19 @@ impl Cpu {
                 self.a = self.rl(self.a);
                 self.f.set_z(false);
                 4
+            }
+            0x18 => {
+                let e = self.fetch8(bus) as i8;
+                self.pc = self.pc.wrapping_add_signed(i16::from(e));
+                12
+            }
+            0x19 => {
+                self.add_hl(self.de());
+                8
+            }
+            0x1a => {
+                self.a = bus.read8(self.de());
+                8
             }
             0x1b => {
                 self.set_de(self.de().wrapping_sub(1));
@@ -484,10 +554,16 @@ impl Cpu {
                 self.f.set_z(false);
                 4
             }
+            0x20 => self.jr_cc(0, bus), // JR NZ, e
             0x21 => {
                 let v = self.fetch16(bus);
                 self.set_hl(v);
                 12
+            }
+            0x22 => {
+                bus.write8(self.hl(), self.a);
+                self.set_hl(self.hl().wrapping_add(1));
+                8
             }
             0x23 => {
                 self.set_hl(self.hl().wrapping_add(1));
@@ -502,6 +578,16 @@ impl Cpu {
             0x27 => {
                 self.daa();
                 4
+            }
+            0x28 => self.jr_cc(1, bus), // JR Z, e
+            0x29 => {
+                self.add_hl(self.hl());
+                8
+            }
+            0x2a => {
+                self.a = bus.read8(self.hl());
+                self.set_hl(self.hl().wrapping_add(1));
+                8
             }
             0x2b => {
                 self.set_hl(self.hl().wrapping_sub(1));
@@ -519,9 +605,15 @@ impl Cpu {
                 self.f.set_h(true);
                 4
             }
+            0x30 => self.jr_cc(2, bus), // JR NC, e
             0x31 => {
                 self.sp = self.fetch16(bus);
                 12
+            }
+            0x32 => {
+                bus.write8(self.hl(), self.a);
+                self.set_hl(self.hl().wrapping_sub(1));
+                8
             }
             0x33 => {
                 self.sp = self.sp.wrapping_add(1);
@@ -529,11 +621,26 @@ impl Cpu {
             }
             0x34 => self.inc_r(6, bus),
             0x35 => self.dec_r(6, bus),
+            0x36 => {
+                let n = self.fetch8(bus);
+                bus.write8(self.hl(), n);
+                12
+            }
             0x37 => {
                 self.f.set_n(false);
                 self.f.set_h(false);
                 self.f.set_c(true);
                 4
+            }
+            0x38 => self.jr_cc(3, bus), // JR C, e
+            0x39 => {
+                self.add_hl(self.sp);
+                8
+            }
+            0x3a => {
+                self.a = bus.read8(self.hl());
+                self.set_hl(self.hl().wrapping_sub(1));
+                8
             }
             0x3b => {
                 self.sp = self.sp.wrapping_sub(1);
@@ -589,6 +696,11 @@ impl Cpu {
                 self.set_bc(v);
                 12
             }
+            0xc2 => self.jp_cc(0, bus), // JP NZ, nn
+            0xc3 => {
+                self.pc = self.fetch16(bus);
+                16
+            }
             0xc5 => {
                 self.push16(bus, self.bc());
                 16
@@ -598,6 +710,7 @@ impl Cpu {
                 self.add_a(n);
                 8
             }
+            0xca => self.jp_cc(1, bus), // JP Z, nn
             0xcb => self.step_cb(bus),
             0xce => {
                 let n = self.fetch8(bus);
@@ -609,6 +722,7 @@ impl Cpu {
                 self.set_de(v);
                 12
             }
+            0xd2 => self.jp_cc(2, bus), // JP NC, nn
             0xd5 => {
                 self.push16(bus, self.de());
                 16
@@ -624,6 +738,7 @@ impl Cpu {
                 self.ime_delay = 0;
                 16
             }
+            0xda => self.jp_cc(3, bus), // JP C, nn
             0xde => {
                 let n = self.fetch8(bus);
                 self.sbc_a(n);
@@ -642,6 +757,10 @@ impl Cpu {
                 let n = self.fetch8(bus);
                 self.and_a(n);
                 8
+            }
+            0xe9 => {
+                self.pc = self.hl();
+                4
             }
             0xee => {
                 let n = self.fetch8(bus);
@@ -1476,6 +1595,321 @@ mod tests {
         assert_eq!(cpu.sp, 0xfffe);
         assert!(cpu.ime);
         assert_eq!(cycles, 16);
+    }
+
+    #[test]
+    fn jr_e_positive_offset() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        mem.load(0x0000, &[0x18, 0x05]); // JR +5
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cpu.pc, 0x0007); // 0x0002 (after fetch) + 5
+        assert_eq!(cycles, 12);
+    }
+
+    #[test]
+    fn jr_e_negative_offset_to_self() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        mem.load(0x0000, &[0x18, 0xfe]); // JR -2  (loop back to itself)
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.pc, 0x0000);
+    }
+
+    #[test]
+    fn jr_cc_taken_when_condition_true() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.f.set_z(true);
+        mem.load(0x0000, &[0x28, 0x10]); // JR Z, +0x10
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cpu.pc, 0x0012);
+        assert_eq!(cycles, 12);
+    }
+
+    #[test]
+    fn jr_cc_not_taken_when_condition_false_advances_past_operand() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.f.set_z(false); // Z clear
+        mem.load(0x0000, &[0x28, 0x10]); // JR Z, +0x10 (not taken)
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cpu.pc, 0x0002); // advanced past operand but no jump
+        assert_eq!(cycles, 8);
+    }
+
+    #[test]
+    fn jr_cc_covers_all_four_conditions() {
+        // each row sets flags such that the condition is taken
+        for (opcode, z, c) in [
+            (0x20_u8, false, false), // JR NZ
+            (0x28, true, false),     // JR Z
+            (0x30, false, false),    // JR NC
+            (0x38, false, true),     // JR C
+        ] {
+            let mut cpu = Cpu::new();
+            let mut mem = Memory::new();
+            cpu.f.set_z(z);
+            cpu.f.set_c(c);
+            mem.load(0x0000, &[opcode, 0x10]);
+
+            assert_eq!(cpu.step(&mut mem), 12, "opcode {:#04x}", opcode);
+            assert_eq!(cpu.pc, 0x0012, "opcode {:#04x}", opcode);
+        }
+    }
+
+    #[test]
+    fn jp_nn_jumps_absolute() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        mem.load(0x0000, &[0xc3, 0x34, 0x12]); // JP 0x1234
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cpu.pc, 0x1234);
+        assert_eq!(cycles, 16);
+    }
+
+    #[test]
+    fn jp_cc_taken_and_not_taken_have_different_cycles() {
+        // not taken
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.f.set_z(false);
+        mem.load(0x0000, &[0xca, 0x34, 0x12]); // JP Z, 0x1234 (not taken)
+        let cycles = cpu.step(&mut mem);
+        assert_eq!(cpu.pc, 0x0003);
+        assert_eq!(cycles, 12);
+
+        // taken
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.f.set_z(true);
+        mem.load(0x0000, &[0xca, 0x34, 0x12]); // JP Z, 0x1234 (taken)
+        let cycles = cpu.step(&mut mem);
+        assert_eq!(cpu.pc, 0x1234);
+        assert_eq!(cycles, 16);
+    }
+
+    #[test]
+    fn jp_hl_uses_hl_as_pc() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_hl(0x4321);
+        mem.load(0x0000, &[0xe9]); // JP HL
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cpu.pc, 0x4321);
+        assert_eq!(cycles, 4);
+    }
+
+    #[test]
+    fn add_hl_dispatches_to_all_pairs() {
+        // ADD HL, BC
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_hl(0x0100);
+        cpu.set_bc(0x0023);
+        mem.load(0x0000, &[0x09]);
+        assert_eq!(cpu.step(&mut mem), 8);
+        assert_eq!(cpu.hl(), 0x0123);
+
+        // ADD HL, DE
+        cpu.set_hl(0x0100);
+        cpu.set_de(0x0023);
+        cpu.pc = 0;
+        mem.load(0x0000, &[0x19]);
+        cpu.step(&mut mem);
+        assert_eq!(cpu.hl(), 0x0123);
+
+        // ADD HL, HL (doubling)
+        cpu.set_hl(0x1234);
+        cpu.pc = 0;
+        mem.load(0x0000, &[0x29]);
+        cpu.step(&mut mem);
+        assert_eq!(cpu.hl(), 0x2468);
+
+        // ADD HL, SP
+        cpu.set_hl(0x0100);
+        cpu.sp = 0x0023;
+        cpu.pc = 0;
+        mem.load(0x0000, &[0x39]);
+        cpu.step(&mut mem);
+        assert_eq!(cpu.hl(), 0x0123);
+    }
+
+    #[test]
+    fn add_hl_sets_half_carry_on_bit_11_overflow() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_hl(0x0fff);
+        cpu.set_bc(0x0001);
+        mem.load(0x0000, &[0x09]); // ADD HL, BC
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.hl(), 0x1000);
+        assert!(!cpu.f.n());
+        assert!(cpu.f.h());
+        assert!(!cpu.f.c());
+    }
+
+    #[test]
+    fn add_hl_sets_carry_on_bit_15_overflow() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_hl(0xffff);
+        cpu.set_bc(0x0001);
+        mem.load(0x0000, &[0x09]); // ADD HL, BC
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.hl(), 0x0000);
+        assert!(!cpu.f.n());
+        assert!(cpu.f.h()); // 0xFFF + 1 carries from bit 11
+        assert!(cpu.f.c());
+    }
+
+    #[test]
+    fn add_hl_preserves_z_and_clears_n() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_hl(0x0100);
+        cpu.set_bc(0x0023);
+        cpu.f.set_z(true);
+        cpu.f.set_n(true);
+        mem.load(0x0000, &[0x09]);
+
+        cpu.step(&mut mem);
+
+        assert!(cpu.f.z(), "Z must be preserved by ADD HL");
+        assert!(!cpu.f.n());
+    }
+
+    #[test]
+    fn ld_indirect_hl_n_writes_immediate_to_memory() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_hl(0xc000);
+        mem.load(0x0000, &[0x36, 0x42]); // LD (HL), 0x42
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cycles, 12);
+        assert_eq!(mem.read8(0xc000), 0x42);
+        assert_eq!(cpu.pc, 0x0002);
+    }
+
+    #[test]
+    fn ld_indirect_bc_and_de_pair_roundtrip() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_bc(0xc000);
+        cpu.set_de(0xc001);
+        cpu.a = 0xab;
+        mem.load(0x0000, &[0x02, 0x12]); // LD (BC), A; LD (DE), A
+
+        assert_eq!(cpu.step(&mut mem), 8);
+        assert_eq!(cpu.step(&mut mem), 8);
+
+        assert_eq!(mem.read8(0xc000), 0xab);
+        assert_eq!(mem.read8(0xc001), 0xab);
+
+        // Reads
+        mem.write8(0xc000, 0x11);
+        mem.write8(0xc001, 0x22);
+        mem.load(0x0002, &[0x0a, 0x1a]); // LD A, (BC); LD A, (DE)
+
+        cpu.step(&mut mem);
+        assert_eq!(cpu.a, 0x11);
+        cpu.step(&mut mem);
+        assert_eq!(cpu.a, 0x22);
+    }
+
+    #[test]
+    fn ld_indirect_hl_inc_a_writes_then_increments_hl() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_hl(0xc000);
+        cpu.a = 0xab;
+        mem.load(0x0000, &[0x22]); // LD (HL+), A
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cycles, 8);
+        assert_eq!(mem.read8(0xc000), 0xab);
+        assert_eq!(cpu.hl(), 0xc001);
+    }
+
+    #[test]
+    fn ld_indirect_hl_dec_a_writes_then_decrements_hl() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_hl(0xc000);
+        cpu.a = 0xab;
+        mem.load(0x0000, &[0x32]); // LD (HL-), A
+
+        cpu.step(&mut mem);
+
+        assert_eq!(mem.read8(0xc000), 0xab);
+        assert_eq!(cpu.hl(), 0xbfff);
+    }
+
+    #[test]
+    fn ld_a_indirect_hl_inc_reads_then_increments_hl() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_hl(0xc000);
+        mem.write8(0xc000, 0xab);
+        mem.load(0x0000, &[0x2a]); // LD A, (HL+)
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0xab);
+        assert_eq!(cpu.hl(), 0xc001);
+    }
+
+    #[test]
+    fn ld_a_indirect_hl_dec_reads_then_decrements_hl() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_hl(0xc000);
+        mem.write8(0xc000, 0xab);
+        mem.load(0x0000, &[0x3a]); // LD A, (HL-)
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0xab);
+        assert_eq!(cpu.hl(), 0xbfff);
+    }
+
+    #[test]
+    fn ld_indirect_pair_preserves_flags() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_bc(0xc000);
+        cpu.set_hl(0xc010);
+        cpu.a = 0x42;
+        cpu.f.set_z(true);
+        cpu.f.set_n(true);
+        cpu.f.set_h(true);
+        cpu.f.set_c(true);
+        mem.load(0x0000, &[0x02, 0x22, 0x32]); // LD (BC),A; LD (HL+),A; LD (HL-),A
+
+        for _ in 0..3 {
+            cpu.step(&mut mem);
+        }
+
+        assert!(cpu.f.z() && cpu.f.n() && cpu.f.h() && cpu.f.c());
     }
 
     #[test]
