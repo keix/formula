@@ -283,6 +283,32 @@ impl Cpu {
         result
     }
 
+    fn daa(&mut self) {
+        let mut adjust = 0_u8;
+        let mut carry = self.f.c();
+        if self.f.n() {
+            if self.f.h() {
+                adjust |= 0x06;
+            }
+            if self.f.c() {
+                adjust |= 0x60;
+            }
+            self.a = self.a.wrapping_sub(adjust);
+        } else {
+            if self.f.h() || (self.a & 0x0f) > 0x09 {
+                adjust |= 0x06;
+            }
+            if self.f.c() || self.a > 0x99 {
+                adjust |= 0x60;
+                carry = true;
+            }
+            self.a = self.a.wrapping_add(adjust);
+        }
+        self.f.set_z(self.a == 0);
+        self.f.set_h(false);
+        self.f.set_c(carry);
+    }
+
     fn step_cb(&mut self, bus: &mut impl Bus) -> u8 {
         let opcode = self.fetch8(bus);
         let src = opcode & 7;
@@ -375,9 +401,19 @@ impl Cpu {
                 self.b = self.fetch8(bus);
                 8
             }
+            0x07 => {
+                self.a = self.rlc(self.a);
+                self.f.set_z(false);
+                4
+            }
             0x0e => {
                 self.c = self.fetch8(bus);
                 8
+            }
+            0x0f => {
+                self.a = self.rrc(self.a);
+                self.f.set_z(false);
+                4
             }
             0x11 => {
                 let v = self.fetch16(bus);
@@ -388,9 +424,19 @@ impl Cpu {
                 self.d = self.fetch8(bus);
                 8
             }
+            0x17 => {
+                self.a = self.rl(self.a);
+                self.f.set_z(false);
+                4
+            }
             0x1e => {
                 self.e = self.fetch8(bus);
                 8
+            }
+            0x1f => {
+                self.a = self.rr(self.a);
+                self.f.set_z(false);
+                4
             }
             0x21 => {
                 let v = self.fetch16(bus);
@@ -401,17 +447,40 @@ impl Cpu {
                 self.h = self.fetch8(bus);
                 8
             }
+            0x27 => {
+                self.daa();
+                4
+            }
             0x2e => {
                 self.l = self.fetch8(bus);
                 8
+            }
+            0x2f => {
+                self.a = !self.a;
+                self.f.set_n(true);
+                self.f.set_h(true);
+                4
             }
             0x31 => {
                 self.sp = self.fetch16(bus);
                 12
             }
+            0x37 => {
+                self.f.set_n(false);
+                self.f.set_h(false);
+                self.f.set_c(true);
+                4
+            }
             0x3e => {
                 self.a = self.fetch8(bus);
                 8
+            }
+            0x3f => {
+                let c = self.f.c();
+                self.f.set_n(false);
+                self.f.set_h(false);
+                self.f.set_c(!c);
+                4
             }
             0x76 => {
                 if !self.ime && pending != 0 {
@@ -1297,6 +1366,146 @@ mod tests {
         assert_eq!(cpu.sp, 0xfffe);
         assert!(cpu.ime);
         assert_eq!(cycles, 16);
+    }
+
+    #[test]
+    fn rlca_keeps_z_clear_even_when_result_is_zero() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0x80;
+        mem.load(0x0000, &[0x07]); // RLCA
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0x01);
+        assert!(!cpu.f.z()); // crucial: Z must be 0 (CB-prefix RLC A would set Z here)
+        assert!(cpu.f.c());
+        assert_eq!(cycles, 4);
+    }
+
+    #[test]
+    fn rrca_rotates_and_clears_z() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0x01;
+        mem.load(0x0000, &[0x0f]); // RRCA
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0x80);
+        assert!(!cpu.f.z());
+        assert!(cpu.f.c());
+    }
+
+    #[test]
+    fn rla_uses_carry_in_and_clears_z() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0x80;
+        cpu.f.set_c(false);
+        mem.load(0x0000, &[0x17]); // RLA
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0x00); // 0x80 << 1 with carry-in 0
+        assert!(!cpu.f.z());     // Z must be 0 even when result is 0
+        assert!(cpu.f.c());      // old bit 7
+    }
+
+    #[test]
+    fn rra_uses_carry_in_and_clears_z() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0x01;
+        cpu.f.set_c(true);
+        mem.load(0x0000, &[0x1f]); // RRA
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0x80); // carry-in 1 to bit 7
+        assert!(!cpu.f.z());
+        assert!(cpu.f.c()); // old bit 0
+    }
+
+    #[test]
+    fn daa_after_bcd_add() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0x45;
+        cpu.b = 0x38;
+        mem.load(0x0000, &[0x80, 0x27]); // ADD A, B; DAA
+
+        cpu.step(&mut mem); // ADD: A = 0x7D
+        assert_eq!(cpu.a, 0x7d);
+
+        cpu.step(&mut mem); // DAA: should adjust to 0x83 (45 + 38 = 83 in BCD)
+        assert_eq!(cpu.a, 0x83);
+        assert!(!cpu.f.c());
+        assert!(!cpu.f.h());
+    }
+
+    #[test]
+    fn daa_after_bcd_sub() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0x47;
+        cpu.b = 0x28;
+        mem.load(0x0000, &[0x90, 0x27]); // SUB B; DAA
+
+        cpu.step(&mut mem); // SUB: A = 0x1F, N=1, H=1
+        cpu.step(&mut mem); // DAA: 47 - 28 = 19 in BCD
+
+        assert_eq!(cpu.a, 0x19);
+        assert!(cpu.f.n());
+    }
+
+    #[test]
+    fn cpl_inverts_a_and_sets_n_h() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0xaa;
+        mem.load(0x0000, &[0x2f]); // CPL
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0x55);
+        assert!(cpu.f.n());
+        assert!(cpu.f.h());
+    }
+
+    #[test]
+    fn scf_sets_carry_and_clears_n_h() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.f.set_z(true); // Z should be preserved
+        cpu.f.set_n(true);
+        cpu.f.set_h(true);
+        mem.load(0x0000, &[0x37]); // SCF
+
+        cpu.step(&mut mem);
+
+        assert!(cpu.f.z()); // preserved
+        assert!(!cpu.f.n());
+        assert!(!cpu.f.h());
+        assert!(cpu.f.c());
+    }
+
+    #[test]
+    fn ccf_toggles_carry() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.f.set_c(true);
+        cpu.f.set_n(true);
+        cpu.f.set_h(true);
+        mem.load(0x0000, &[0x3f, 0x3f]); // CCF; CCF
+
+        cpu.step(&mut mem);
+        assert!(!cpu.f.c());
+        assert!(!cpu.f.n());
+        assert!(!cpu.f.h());
+
+        cpu.step(&mut mem);
+        assert!(cpu.f.c());
     }
 
     #[test]
