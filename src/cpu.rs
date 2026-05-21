@@ -177,6 +177,122 @@ impl Cpu {
         self.f.set_c(borrow);
     }
 
+    fn rlc(&mut self, value: u8) -> u8 {
+        let result = value.rotate_left(1);
+        self.f.set_z(result == 0);
+        self.f.set_n(false);
+        self.f.set_h(false);
+        self.f.set_c(value & 0x80 != 0);
+        result
+    }
+
+    fn rrc(&mut self, value: u8) -> u8 {
+        let result = value.rotate_right(1);
+        self.f.set_z(result == 0);
+        self.f.set_n(false);
+        self.f.set_h(false);
+        self.f.set_c(value & 0x01 != 0);
+        result
+    }
+
+    fn rl(&mut self, value: u8) -> u8 {
+        let carry_in = u8::from(self.f.c());
+        let result = (value << 1) | carry_in;
+        self.f.set_z(result == 0);
+        self.f.set_n(false);
+        self.f.set_h(false);
+        self.f.set_c(value & 0x80 != 0);
+        result
+    }
+
+    fn rr(&mut self, value: u8) -> u8 {
+        let carry_in = u8::from(self.f.c());
+        let result = (value >> 1) | (carry_in << 7);
+        self.f.set_z(result == 0);
+        self.f.set_n(false);
+        self.f.set_h(false);
+        self.f.set_c(value & 0x01 != 0);
+        result
+    }
+
+    fn sla(&mut self, value: u8) -> u8 {
+        let result = value << 1;
+        self.f.set_z(result == 0);
+        self.f.set_n(false);
+        self.f.set_h(false);
+        self.f.set_c(value & 0x80 != 0);
+        result
+    }
+
+    fn sra(&mut self, value: u8) -> u8 {
+        let result = (value >> 1) | (value & 0x80);
+        self.f.set_z(result == 0);
+        self.f.set_n(false);
+        self.f.set_h(false);
+        self.f.set_c(value & 0x01 != 0);
+        result
+    }
+
+    fn swap(&mut self, value: u8) -> u8 {
+        let result = value.rotate_left(4);
+        self.f.set_z(result == 0);
+        self.f.set_n(false);
+        self.f.set_h(false);
+        self.f.set_c(false);
+        result
+    }
+
+    fn srl(&mut self, value: u8) -> u8 {
+        let result = value >> 1;
+        self.f.set_z(result == 0);
+        self.f.set_n(false);
+        self.f.set_h(false);
+        self.f.set_c(value & 0x01 != 0);
+        result
+    }
+
+    fn step_cb(&mut self, bus: &mut impl Bus) -> u8 {
+        let opcode = self.fetch8(bus);
+        let src = opcode & 7;
+        let value = self.read_r(src, bus);
+
+        match opcode {
+            0x00..=0x3f => {
+                let op = (opcode >> 3) & 7;
+                let result = match op {
+                    0 => self.rlc(value),
+                    1 => self.rrc(value),
+                    2 => self.rl(value),
+                    3 => self.rr(value),
+                    4 => self.sla(value),
+                    5 => self.sra(value),
+                    6 => self.swap(value),
+                    7 => self.srl(value),
+                    _ => unreachable!(),
+                };
+                self.write_r(src, result, bus);
+                if src == 6 { 16 } else { 8 }
+            }
+            0x40..=0x7f => {
+                let bit = (opcode >> 3) & 7;
+                self.f.set_z(value & (1 << bit) == 0);
+                self.f.set_n(false);
+                self.f.set_h(true);
+                if src == 6 { 12 } else { 8 }
+            }
+            0x80..=0xbf => {
+                let bit = (opcode >> 3) & 7;
+                self.write_r(src, value & !(1 << bit), bus);
+                if src == 6 { 16 } else { 8 }
+            }
+            0xc0..=0xff => {
+                let bit = (opcode >> 3) & 7;
+                self.write_r(src, value | (1 << bit), bus);
+                if src == 6 { 16 } else { 8 }
+            }
+        }
+    }
+
     pub fn step(&mut self, bus: &mut impl Bus) -> u8 {
         if self.halted {
             return 4;
@@ -241,6 +357,7 @@ impl Cpu {
                 }
                 if src == 6 { 8 } else { 4 }
             }
+            0xcb => self.step_cb(bus),
             _ => panic!("unimplemented opcode: {:#04x}", opcode),
         }
     }
@@ -689,5 +806,208 @@ mod tests {
 
         assert_eq!(cpu.a, 0x30);
         assert_eq!(cycles, 8);
+    }
+
+    #[test]
+    fn cb_rlc_b_rotates_left_and_captures_msb_in_carry() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.b = 0b1010_1010;
+        mem.load(0x0000, &[0xcb, 0x00]); // RLC B
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cpu.b, 0b0101_0101);
+        assert!(!cpu.f.z());
+        assert!(!cpu.f.n());
+        assert!(!cpu.f.h());
+        assert!(cpu.f.c());
+        assert_eq!(cycles, 8);
+    }
+
+    #[test]
+    fn cb_rrc_b_rotates_right_and_captures_lsb_in_carry() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.b = 0b0000_0001;
+        mem.load(0x0000, &[0xcb, 0x08]); // RRC B
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.b, 0b1000_0000);
+        assert!(cpu.f.c());
+    }
+
+    #[test]
+    fn cb_rl_b_inserts_carry_at_bit0() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.b = 0b1000_0000;
+        cpu.f.set_c(true);
+        mem.load(0x0000, &[0xcb, 0x10]); // RL B
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.b, 0b0000_0001);
+        assert!(cpu.f.c());
+    }
+
+    #[test]
+    fn cb_rr_b_inserts_carry_at_bit7() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.b = 0b0000_0001;
+        cpu.f.set_c(true);
+        mem.load(0x0000, &[0xcb, 0x18]); // RR B
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.b, 0b1000_0000);
+        assert!(cpu.f.c());
+    }
+
+    #[test]
+    fn cb_sla_b_shifts_in_zero() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.b = 0b1010_1010;
+        mem.load(0x0000, &[0xcb, 0x20]); // SLA B
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.b, 0b0101_0100);
+        assert!(cpu.f.c());
+    }
+
+    #[test]
+    fn cb_sra_b_preserves_sign_bit() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.b = 0b1000_0001;
+        mem.load(0x0000, &[0xcb, 0x28]); // SRA B
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.b, 0b1100_0000);
+        assert!(cpu.f.c());
+    }
+
+    #[test]
+    fn cb_swap_b_swaps_nibbles_and_clears_carry() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.b = 0xab;
+        cpu.f.set_c(true);
+        mem.load(0x0000, &[0xcb, 0x30]); // SWAP B
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.b, 0xba);
+        assert!(!cpu.f.c());
+    }
+
+    #[test]
+    fn cb_srl_b_shifts_in_zero_at_top() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.b = 0b1000_0001;
+        mem.load(0x0000, &[0xcb, 0x38]); // SRL B
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.b, 0b0100_0000);
+        assert!(cpu.f.c());
+    }
+
+    #[test]
+    fn cb_bit_b_clears_z_when_bit_set() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.b = 0b0000_0100;
+        mem.load(0x0000, &[0xcb, 0x50]); // BIT 2, B
+
+        cpu.step(&mut mem);
+
+        assert!(!cpu.f.z());
+        assert!(!cpu.f.n());
+        assert!(cpu.f.h());
+    }
+
+    #[test]
+    fn cb_bit_b_sets_z_when_bit_clear() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.b = 0b0000_0100;
+        mem.load(0x0000, &[0xcb, 0x48]); // BIT 1, B
+
+        cpu.step(&mut mem);
+
+        assert!(cpu.f.z());
+    }
+
+    #[test]
+    fn cb_bit_indirect_hl_takes_12_cycles() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_hl(0xc000);
+        mem.write8(0xc000, 0xff);
+        mem.load(0x0000, &[0xcb, 0x46]); // BIT 0, (HL)
+
+        let cycles = cpu.step(&mut mem);
+
+        assert!(!cpu.f.z());
+        assert_eq!(cycles, 12);
+    }
+
+    #[test]
+    fn cb_res_b_clears_bit() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.b = 0xff;
+        mem.load(0x0000, &[0xcb, 0x90]); // RES 2, B
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.b, 0b1111_1011);
+    }
+
+    #[test]
+    fn cb_set_b_sets_bit() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.b = 0x00;
+        mem.load(0x0000, &[0xcb, 0xd0]); // SET 2, B
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.b, 0b0000_0100);
+    }
+
+    #[test]
+    fn cb_rotate_indirect_hl_takes_16_cycles() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_hl(0xc000);
+        mem.write8(0xc000, 0x01);
+        mem.load(0x0000, &[0xcb, 0x06]); // RLC (HL)
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(mem.read8(0xc000), 0x02);
+        assert_eq!(cycles, 16);
+    }
+
+    #[test]
+    fn cb_res_indirect_hl_takes_16_cycles() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_hl(0xc000);
+        mem.write8(0xc000, 0xff);
+        mem.load(0x0000, &[0xcb, 0x86]); // RES 0, (HL)
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(mem.read8(0xc000), 0xfe);
+        assert_eq!(cycles, 16);
     }
 }
