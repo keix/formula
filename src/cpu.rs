@@ -272,6 +272,39 @@ impl Cpu {
         }
     }
 
+    fn call_nn(&mut self, bus: &mut impl Bus) -> u8 {
+        let nn = self.fetch16(bus);
+        self.push16(bus, self.pc);
+        self.pc = nn;
+        24
+    }
+
+    fn call_cc(&mut self, cc: u8, bus: &mut impl Bus) -> u8 {
+        let nn = self.fetch16(bus);
+        if self.cc_satisfied(cc) {
+            self.push16(bus, self.pc);
+            self.pc = nn;
+            24
+        } else {
+            12
+        }
+    }
+
+    fn ret_cc(&mut self, cc: u8, bus: &mut impl Bus) -> u8 {
+        if self.cc_satisfied(cc) {
+            self.pc = self.pop16(bus);
+            20
+        } else {
+            8
+        }
+    }
+
+    fn rst(&mut self, vector: u16, bus: &mut impl Bus) -> u8 {
+        self.push16(bus, self.pc);
+        self.pc = vector;
+        16
+    }
+
     fn rlc(&mut self, value: u8) -> u8 {
         let result = value.rotate_left(1);
         self.f.set_z(result == 0);
@@ -691,6 +724,7 @@ impl Cpu {
                 }
                 if src == 6 { 8 } else { 4 }
             }
+            0xc0 => self.ret_cc(0, bus), // RET NZ
             0xc1 => {
                 let v = self.pop16(bus);
                 self.set_bc(v);
@@ -701,6 +735,7 @@ impl Cpu {
                 self.pc = self.fetch16(bus);
                 16
             }
+            0xc4 => self.call_cc(0, bus), // CALL NZ
             0xc5 => {
                 self.push16(bus, self.bc());
                 16
@@ -710,19 +745,30 @@ impl Cpu {
                 self.add_a(n);
                 8
             }
+            0xc7 => self.rst(0x0000, bus),
+            0xc8 => self.ret_cc(1, bus), // RET Z
+            0xc9 => {
+                self.pc = self.pop16(bus);
+                16
+            }
             0xca => self.jp_cc(1, bus), // JP Z, nn
             0xcb => self.step_cb(bus),
+            0xcc => self.call_cc(1, bus), // CALL Z
+            0xcd => self.call_nn(bus),    // CALL nn
             0xce => {
                 let n = self.fetch8(bus);
                 self.adc_a(n);
                 8
             }
+            0xcf => self.rst(0x0008, bus),
+            0xd0 => self.ret_cc(2, bus), // RET NC
             0xd1 => {
                 let v = self.pop16(bus);
                 self.set_de(v);
                 12
             }
             0xd2 => self.jp_cc(2, bus), // JP NC, nn
+            0xd4 => self.call_cc(2, bus), // CALL NC
             0xd5 => {
                 self.push16(bus, self.de());
                 16
@@ -732,6 +778,8 @@ impl Cpu {
                 self.sub_a(n);
                 8
             }
+            0xd7 => self.rst(0x0010, bus),
+            0xd8 => self.ret_cc(3, bus), // RET C
             0xd9 => {
                 self.pc = self.pop16(bus);
                 self.ime = true;
@@ -739,15 +787,26 @@ impl Cpu {
                 16
             }
             0xda => self.jp_cc(3, bus), // JP C, nn
+            0xdc => self.call_cc(3, bus), // CALL C
             0xde => {
                 let n = self.fetch8(bus);
                 self.sbc_a(n);
                 8
             }
+            0xdf => self.rst(0x0018, bus),
+            0xe0 => {
+                let n = self.fetch8(bus);
+                bus.write8(0xff00 + u16::from(n), self.a);
+                12
+            }
             0xe1 => {
                 let v = self.pop16(bus);
                 self.set_hl(v);
                 12
+            }
+            0xe2 => {
+                bus.write8(0xff00 + u16::from(self.c), self.a);
+                8
             }
             0xe5 => {
                 self.push16(bus, self.hl());
@@ -758,19 +817,35 @@ impl Cpu {
                 self.and_a(n);
                 8
             }
+            0xe7 => self.rst(0x0020, bus),
             0xe9 => {
                 self.pc = self.hl();
                 4
+            }
+            0xea => {
+                let nn = self.fetch16(bus);
+                bus.write8(nn, self.a);
+                16
             }
             0xee => {
                 let n = self.fetch8(bus);
                 self.xor_a(n);
                 8
             }
+            0xef => self.rst(0x0028, bus),
+            0xf0 => {
+                let n = self.fetch8(bus);
+                self.a = bus.read8(0xff00 + u16::from(n));
+                12
+            }
             0xf1 => {
                 let v = self.pop16(bus);
                 self.set_af(v);
                 12
+            }
+            0xf2 => {
+                self.a = bus.read8(0xff00 + u16::from(self.c));
+                8
             }
             0xf3 => {
                 self.ime = false;
@@ -786,6 +861,12 @@ impl Cpu {
                 self.or_a(n);
                 8
             }
+            0xf7 => self.rst(0x0030, bus),
+            0xfa => {
+                let nn = self.fetch16(bus);
+                self.a = bus.read8(nn);
+                16
+            }
             0xfb => {
                 self.ime_delay = 2;
                 4
@@ -795,6 +876,7 @@ impl Cpu {
                 self.cp_a(n);
                 8
             }
+            0xff => self.rst(0x0038, bus),
             _ => panic!("unimplemented opcode: {:#04x}", opcode),
         };
 
@@ -935,7 +1017,7 @@ mod tests {
     fn unimplemented_opcode_panics() {
         let mut cpu = Cpu::new();
         let mut mem = Memory::new();
-        mem.load(0x0000, &[0xff]);
+        mem.load(0x0000, &[0xd3]); // illegal opcode
 
         cpu.step(&mut mem);
     }
@@ -1595,6 +1677,210 @@ mod tests {
         assert_eq!(cpu.sp, 0xfffe);
         assert!(cpu.ime);
         assert_eq!(cycles, 16);
+    }
+
+    #[test]
+    fn ldh_n_a_and_ldh_a_n_use_ff00_offset() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0xab;
+        mem.load(0x0000, &[0xe0, 0x40]); // LDH (0x40), A → 0xFF40
+
+        let cycles = cpu.step(&mut mem);
+        assert_eq!(mem.read8(0xff40), 0xab);
+        assert_eq!(cycles, 12);
+        assert_eq!(cpu.pc, 0x0002);
+
+        cpu.a = 0;
+        mem.write8(0xff40, 0x66);
+        mem.load(0x0002, &[0xf0, 0x40]); // LDH A, (0x40)
+        let cycles = cpu.step(&mut mem);
+        assert_eq!(cpu.a, 0x66);
+        assert_eq!(cycles, 12);
+    }
+
+    #[test]
+    fn ld_indirect_c_uses_ff00_plus_c_register() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0xab;
+        cpu.c = 0x40;
+        mem.load(0x0000, &[0xe2]); // LD (C), A → 0xFF40
+
+        let cycles = cpu.step(&mut mem);
+        assert_eq!(mem.read8(0xff40), 0xab);
+        assert_eq!(cycles, 8);
+
+        cpu.a = 0;
+        mem.write8(0xff40, 0x66);
+        mem.load(0x0001, &[0xf2]); // LD A, (C)
+        let cycles = cpu.step(&mut mem);
+        assert_eq!(cpu.a, 0x66);
+        assert_eq!(cycles, 8);
+    }
+
+    #[test]
+    fn ld_indirect_nn_roundtrips_through_absolute_address() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0xab;
+        mem.load(0x0000, &[0xea, 0x00, 0xc0]); // LD (0xC000), A
+
+        let cycles = cpu.step(&mut mem);
+        assert_eq!(mem.read8(0xc000), 0xab);
+        assert_eq!(cycles, 16);
+        assert_eq!(cpu.pc, 0x0003);
+
+        cpu.a = 0;
+        mem.write8(0xc000, 0x66);
+        mem.load(0x0003, &[0xfa, 0x00, 0xc0]); // LD A, (0xC000)
+        let cycles = cpu.step(&mut mem);
+        assert_eq!(cpu.a, 0x66);
+        assert_eq!(cycles, 16);
+    }
+
+    #[test]
+    fn call_nn_pushes_next_pc_and_jumps() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.pc = 0x1000;
+        cpu.sp = 0xfffe;
+        mem.write8(0x1000, 0xcd);
+        mem.write8(0x1001, 0x34);
+        mem.write8(0x1002, 0x12); // CALL 0x1234
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cpu.pc, 0x1234);
+        assert_eq!(cpu.sp, 0xfffc);
+        assert_eq!(mem.read8(0xfffc), 0x03); // PC was 0x1003 after fetch
+        assert_eq!(mem.read8(0xfffd), 0x10);
+        assert_eq!(cycles, 24);
+    }
+
+    #[test]
+    fn call_cc_taken_and_not_taken_have_different_cycles() {
+        // not taken
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.pc = 0x1000;
+        cpu.sp = 0xfffe;
+        cpu.f.set_z(false);
+        mem.write8(0x1000, 0xcc); // CALL Z, 0x1234 (not taken)
+        mem.write8(0x1001, 0x34);
+        mem.write8(0x1002, 0x12);
+        let cycles = cpu.step(&mut mem);
+        assert_eq!(cpu.pc, 0x1003);
+        assert_eq!(cpu.sp, 0xfffe); // SP unchanged
+        assert_eq!(cycles, 12);
+
+        // taken
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.pc = 0x1000;
+        cpu.sp = 0xfffe;
+        cpu.f.set_z(true);
+        mem.write8(0x1000, 0xcc);
+        mem.write8(0x1001, 0x34);
+        mem.write8(0x1002, 0x12);
+        let cycles = cpu.step(&mut mem);
+        assert_eq!(cpu.pc, 0x1234);
+        assert_eq!(cpu.sp, 0xfffc);
+        assert_eq!(cycles, 24);
+    }
+
+    #[test]
+    fn ret_pops_pc() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.pc = 0x1000;
+        cpu.sp = 0xfffc;
+        mem.write8(0xfffc, 0x34); // low
+        mem.write8(0xfffd, 0x12); // high
+        mem.write8(0x1000, 0xc9); // RET
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cpu.pc, 0x1234);
+        assert_eq!(cpu.sp, 0xfffe);
+        assert_eq!(cycles, 16);
+    }
+
+    #[test]
+    fn ret_cc_taken_takes_20_cycles_not_taken_takes_8() {
+        // not taken
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.pc = 0x1000;
+        cpu.sp = 0xfffc;
+        cpu.f.set_z(false);
+        mem.write8(0xfffc, 0x34);
+        mem.write8(0xfffd, 0x12);
+        mem.write8(0x1000, 0xc8); // RET Z (not taken)
+        let cycles = cpu.step(&mut mem);
+        assert_eq!(cpu.pc, 0x1001); // just past RET cc
+        assert_eq!(cpu.sp, 0xfffc); // SP unchanged
+        assert_eq!(cycles, 8);
+
+        // taken
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.pc = 0x1000;
+        cpu.sp = 0xfffc;
+        cpu.f.set_z(true);
+        mem.write8(0xfffc, 0x34);
+        mem.write8(0xfffd, 0x12);
+        mem.write8(0x1000, 0xc8);
+        let cycles = cpu.step(&mut mem);
+        assert_eq!(cpu.pc, 0x1234);
+        assert_eq!(cpu.sp, 0xfffe);
+        assert_eq!(cycles, 20);
+    }
+
+    #[test]
+    fn rst_pushes_pc_and_jumps_to_vector_for_all_8_opcodes() {
+        for (opcode, vector) in [
+            (0xc7_u8, 0x0000_u16),
+            (0xcf, 0x0008),
+            (0xd7, 0x0010),
+            (0xdf, 0x0018),
+            (0xe7, 0x0020),
+            (0xef, 0x0028),
+            (0xf7, 0x0030),
+            (0xff, 0x0038),
+        ] {
+            let mut cpu = Cpu::new();
+            let mut mem = Memory::new();
+            cpu.pc = 0x1000;
+            cpu.sp = 0xfffe;
+            mem.write8(0x1000, opcode);
+
+            let cycles = cpu.step(&mut mem);
+
+            assert_eq!(cpu.pc, vector, "opcode {:#04x}", opcode);
+            assert_eq!(cpu.sp, 0xfffc, "opcode {:#04x}", opcode);
+            assert_eq!(mem.read8(0xfffc), 0x01, "opcode {:#04x}", opcode);
+            assert_eq!(mem.read8(0xfffd), 0x10, "opcode {:#04x}", opcode);
+            assert_eq!(cycles, 16, "opcode {:#04x}", opcode);
+        }
+    }
+
+    #[test]
+    fn call_then_ret_roundtrips() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.pc = 0x1000;
+        cpu.sp = 0xfffe;
+        mem.write8(0x1000, 0xcd); // CALL 0x2000
+        mem.write8(0x1001, 0x00);
+        mem.write8(0x1002, 0x20);
+        mem.write8(0x2000, 0xc9); // RET
+
+        cpu.step(&mut mem); // CALL
+        assert_eq!(cpu.pc, 0x2000);
+        cpu.step(&mut mem); // RET
+        assert_eq!(cpu.pc, 0x1003);
+        assert_eq!(cpu.sp, 0xfffe);
     }
 
     #[test]
