@@ -523,7 +523,17 @@ impl Cpu {
                 self.push16(bus, self.bc());
                 16
             }
+            0xc6 => {
+                let n = self.fetch8(bus);
+                self.add_a(n);
+                8
+            }
             0xcb => self.step_cb(bus),
+            0xce => {
+                let n = self.fetch8(bus);
+                self.adc_a(n);
+                8
+            }
             0xd1 => {
                 let v = self.pop16(bus);
                 self.set_de(v);
@@ -533,11 +543,21 @@ impl Cpu {
                 self.push16(bus, self.de());
                 16
             }
+            0xd6 => {
+                let n = self.fetch8(bus);
+                self.sub_a(n);
+                8
+            }
             0xd9 => {
                 self.pc = self.pop16(bus);
                 self.ime = true;
                 self.ime_delay = 0;
                 16
+            }
+            0xde => {
+                let n = self.fetch8(bus);
+                self.sbc_a(n);
+                8
             }
             0xe1 => {
                 let v = self.pop16(bus);
@@ -547,6 +567,16 @@ impl Cpu {
             0xe5 => {
                 self.push16(bus, self.hl());
                 16
+            }
+            0xe6 => {
+                let n = self.fetch8(bus);
+                self.and_a(n);
+                8
+            }
+            0xee => {
+                let n = self.fetch8(bus);
+                self.xor_a(n);
+                8
             }
             0xf1 => {
                 let v = self.pop16(bus);
@@ -562,9 +592,19 @@ impl Cpu {
                 self.push16(bus, self.af());
                 16
             }
+            0xf6 => {
+                let n = self.fetch8(bus);
+                self.or_a(n);
+                8
+            }
             0xfb => {
                 self.ime_delay = 2;
                 4
+            }
+            0xfe => {
+                let n = self.fetch8(bus);
+                self.cp_a(n);
+                8
             }
             _ => panic!("unimplemented opcode: {:#04x}", opcode),
         };
@@ -1366,6 +1406,74 @@ mod tests {
         assert_eq!(cpu.sp, 0xfffe);
         assert!(cpu.ime);
         assert_eq!(cycles, 16);
+    }
+
+    #[test]
+    fn alu_immediate_all_opcodes_dispatch_correctly() {
+        // Each opcode fetches its immediate and delegates to the matching ALU helper.
+        for (opcode, imm, expected_a) in [
+            (0xc6_u8, 0x05_u8, 0x15_u8), // ADD A, 0x05
+            (0xce, 0x05, 0x15),          // ADC A, 0x05 (no carry-in)
+            (0xd6, 0x05, 0x0b),          // SUB A, 0x05
+            (0xde, 0x05, 0x0b),          // SBC A, 0x05 (no borrow-in)
+            (0xe6, 0x0f, 0x00),          // AND A, 0x0F
+            (0xee, 0x05, 0x15),          // XOR A, 0x05
+            (0xf6, 0x05, 0x15),          // OR  A, 0x05
+        ] {
+            let mut cpu = Cpu::new();
+            let mut mem = Memory::new();
+            cpu.a = 0x10;
+            mem.load(0x0000, &[opcode, imm]);
+
+            let cycles = cpu.step(&mut mem);
+
+            assert_eq!(cpu.a, expected_a, "opcode {:#04x}", opcode);
+            assert_eq!(cycles, 8, "opcode {:#04x}", opcode);
+            assert_eq!(cpu.pc, 0x0002, "opcode {:#04x}", opcode);
+        }
+    }
+
+    #[test]
+    fn cp_a_n_does_not_modify_a() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0x42;
+        mem.load(0x0000, &[0xfe, 0x40]); // CP A, 0x40
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0x42);
+        assert!(cpu.f.n());
+        assert!(!cpu.f.z());
+        assert!(!cpu.f.c());
+        assert_eq!(cycles, 8);
+    }
+
+    #[test]
+    fn adc_a_n_uses_carry_in() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0x10;
+        cpu.f.set_c(true);
+        mem.load(0x0000, &[0xce, 0x20]); // ADC A, 0x20
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0x31);
+    }
+
+    #[test]
+    fn sbc_a_n_uses_borrow_in() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0x10;
+        cpu.f.set_c(true);
+        mem.load(0x0000, &[0xde, 0x01]); // SBC A, 0x01
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0x0e); // 0x10 - 0x01 - 0x01 = 0x0e
+        assert!(cpu.f.n());
     }
 
     #[test]
