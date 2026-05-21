@@ -15,6 +15,7 @@ pub struct Cpu {
     pub halted: bool,
     pub ime: bool,
     pub halt_bug: bool,
+    pub locked: bool,
     ime_delay: u8,
 }
 
@@ -34,6 +35,7 @@ impl Cpu {
             halted: false,
             ime: false,
             halt_bug: false,
+            locked: false,
             ime_delay: 0,
         }
     }
@@ -484,6 +486,10 @@ impl Cpu {
     }
 
     pub fn step(&mut self, bus: &mut impl Bus) -> u8 {
+        if self.locked {
+            return 4;
+        }
+
         let pending = bus.read8(0xff0f) & bus.read8(0xffff) & 0x1f;
 
         if self.halted && pending != 0 {
@@ -912,6 +918,11 @@ impl Cpu {
                 8
             }
             0xff => self.rst(0x0038, bus),
+            // Illegal opcodes lock the CPU on real hardware
+            0xd3 | 0xdb | 0xdd | 0xe3 | 0xe4 | 0xeb | 0xec | 0xed | 0xf4 | 0xfc | 0xfd => {
+                self.locked = true;
+                4
+            }
             _ => panic!("unimplemented opcode: {:#04x}", opcode),
         };
 
@@ -1052,7 +1063,7 @@ mod tests {
     fn unimplemented_opcode_panics() {
         let mut cpu = Cpu::new();
         let mut mem = Memory::new();
-        mem.load(0x0000, &[0xd3]); // illegal opcode
+        mem.load(0x0000, &[0x10]); // STOP (not yet implemented)
 
         cpu.step(&mut mem);
     }
@@ -1712,6 +1723,44 @@ mod tests {
         assert_eq!(cpu.sp, 0xfffe);
         assert!(cpu.ime);
         assert_eq!(cycles, 16);
+    }
+
+    #[test]
+    fn illegal_opcodes_lock_cpu() {
+        for opcode in [0xd3_u8, 0xdb, 0xdd, 0xe3, 0xe4, 0xeb, 0xec, 0xed, 0xf4, 0xfc, 0xfd] {
+            let mut cpu = Cpu::new();
+            let mut mem = Memory::new();
+            mem.load(0x0000, &[opcode]);
+
+            let cycles = cpu.step(&mut mem);
+            assert!(cpu.locked, "opcode {:#04x} should lock", opcode);
+            assert_eq!(cycles, 4, "opcode {:#04x}", opcode);
+
+            // Subsequent steps return 4 with PC frozen
+            let pc_at_lock = cpu.pc;
+            assert_eq!(cpu.step(&mut mem), 4, "opcode {:#04x}", opcode);
+            assert_eq!(cpu.pc, pc_at_lock, "opcode {:#04x}: PC must freeze", opcode);
+        }
+    }
+
+    #[test]
+    fn locked_cpu_ignores_pending_interrupts() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.locked = true;
+        cpu.ime = true;
+        cpu.pc = 0x1000;
+        cpu.sp = 0xfffe;
+        mem.write8(0xff0f, 0x01); // VBlank pending
+        mem.write8(0xffff, 0x01); // VBlank enabled
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cycles, 4);
+        assert_eq!(cpu.pc, 0x1000); // no jump to vector
+        assert!(cpu.ime); // IME unchanged
+        assert_eq!(mem.read8(0xff0f), 0x01); // IF unchanged
+        assert_eq!(cpu.sp, 0xfffe); // no push
     }
 
     #[test]
