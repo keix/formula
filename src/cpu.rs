@@ -100,6 +100,83 @@ impl Cpu {
         }
     }
 
+    fn add_a(&mut self, value: u8) {
+        let (result, carry) = self.a.overflowing_add(value);
+        let half = (self.a & 0xf) + (value & 0xf) > 0xf;
+        self.a = result;
+        self.f.set_z(result == 0);
+        self.f.set_n(false);
+        self.f.set_h(half);
+        self.f.set_c(carry);
+    }
+
+    fn adc_a(&mut self, value: u8) {
+        let carry_in = u8::from(self.f.c());
+        let result = self.a.wrapping_add(value).wrapping_add(carry_in);
+        let carry = u16::from(self.a) + u16::from(value) + u16::from(carry_in) > 0xff;
+        let half = (self.a & 0xf) + (value & 0xf) + carry_in > 0xf;
+        self.a = result;
+        self.f.set_z(result == 0);
+        self.f.set_n(false);
+        self.f.set_h(half);
+        self.f.set_c(carry);
+    }
+
+    fn sub_a(&mut self, value: u8) {
+        let (result, borrow) = self.a.overflowing_sub(value);
+        let half = (self.a & 0xf) < (value & 0xf);
+        self.a = result;
+        self.f.set_z(result == 0);
+        self.f.set_n(true);
+        self.f.set_h(half);
+        self.f.set_c(borrow);
+    }
+
+    fn sbc_a(&mut self, value: u8) {
+        let carry_in = u8::from(self.f.c());
+        let result = self.a.wrapping_sub(value).wrapping_sub(carry_in);
+        let borrow = u16::from(self.a) < u16::from(value) + u16::from(carry_in);
+        let half = (self.a & 0xf) < (value & 0xf) + carry_in;
+        self.a = result;
+        self.f.set_z(result == 0);
+        self.f.set_n(true);
+        self.f.set_h(half);
+        self.f.set_c(borrow);
+    }
+
+    fn and_a(&mut self, value: u8) {
+        self.a &= value;
+        self.f.set_z(self.a == 0);
+        self.f.set_n(false);
+        self.f.set_h(true);
+        self.f.set_c(false);
+    }
+
+    fn xor_a(&mut self, value: u8) {
+        self.a ^= value;
+        self.f.set_z(self.a == 0);
+        self.f.set_n(false);
+        self.f.set_h(false);
+        self.f.set_c(false);
+    }
+
+    fn or_a(&mut self, value: u8) {
+        self.a |= value;
+        self.f.set_z(self.a == 0);
+        self.f.set_n(false);
+        self.f.set_h(false);
+        self.f.set_c(false);
+    }
+
+    fn cp_a(&mut self, value: u8) {
+        let (result, borrow) = self.a.overflowing_sub(value);
+        let half = (self.a & 0xf) < (value & 0xf);
+        self.f.set_z(result == 0);
+        self.f.set_n(true);
+        self.f.set_h(half);
+        self.f.set_c(borrow);
+    }
+
     pub fn step(&mut self, bus: &mut impl Bus) -> u8 {
         if self.halted {
             return 4;
@@ -146,6 +223,23 @@ impl Cpu {
                 let value = self.read_r(src, bus);
                 self.write_r(dst, value, bus);
                 if dst == 6 || src == 6 { 8 } else { 4 }
+            }
+            0x80..=0xbf => {
+                let op = (opcode >> 3) & 7;
+                let src = opcode & 7;
+                let value = self.read_r(src, bus);
+                match op {
+                    0 => self.add_a(value),
+                    1 => self.adc_a(value),
+                    2 => self.sub_a(value),
+                    3 => self.sbc_a(value),
+                    4 => self.and_a(value),
+                    5 => self.xor_a(value),
+                    6 => self.or_a(value),
+                    7 => self.cp_a(value),
+                    _ => unreachable!(),
+                }
+                if src == 6 { 8 } else { 4 }
             }
             _ => panic!("unimplemented opcode: {:#04x}", opcode),
         }
@@ -402,5 +496,198 @@ mod tests {
         assert_eq!(cpu.l, 0x50);
         assert_eq!(cpu.a, 0xa0);
         assert_eq!(mem.read8(0xc000), 0x66);
+    }
+
+    #[test]
+    fn add_a_b_sets_half_carry_only() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0x0f;
+        cpu.b = 0x01;
+        mem.load(0x0000, &[0x80]); // ADD A, B
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0x10);
+        assert!(!cpu.f.z());
+        assert!(!cpu.f.n());
+        assert!(cpu.f.h());
+        assert!(!cpu.f.c());
+        assert_eq!(cycles, 4);
+    }
+
+    #[test]
+    fn add_a_b_overflow_sets_zero_and_carry() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0xff;
+        cpu.b = 0x01;
+        mem.load(0x0000, &[0x80]); // ADD A, B
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0x00);
+        assert!(cpu.f.z());
+        assert!(!cpu.f.n());
+        assert!(cpu.f.h());
+        assert!(cpu.f.c());
+    }
+
+    #[test]
+    fn adc_a_b_propagates_carry_in() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0x10;
+        cpu.b = 0x20;
+        cpu.f.set_c(true);
+        mem.load(0x0000, &[0x88]); // ADC A, B
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0x31);
+        assert!(!cpu.f.c());
+    }
+
+    #[test]
+    fn sub_a_b_to_zero_sets_z_and_n() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0x42;
+        cpu.b = 0x42;
+        mem.load(0x0000, &[0x90]); // SUB B
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0x00);
+        assert!(cpu.f.z());
+        assert!(cpu.f.n());
+        assert!(!cpu.f.h());
+        assert!(!cpu.f.c());
+    }
+
+    #[test]
+    fn sub_a_b_underflow_sets_carry_and_half_carry() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0x00;
+        cpu.b = 0x01;
+        mem.load(0x0000, &[0x90]); // SUB B
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0xff);
+        assert!(!cpu.f.z());
+        assert!(cpu.f.n());
+        assert!(cpu.f.h());
+        assert!(cpu.f.c());
+    }
+
+    #[test]
+    fn sbc_a_b_propagates_borrow_in() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0x10;
+        cpu.b = 0x01;
+        cpu.f.set_c(true);
+        mem.load(0x0000, &[0x98]); // SBC A, B
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0x0e);
+        assert!(cpu.f.n());
+    }
+
+    #[test]
+    fn and_a_b_always_sets_half_carry() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0xff;
+        cpu.b = 0xf0;
+        mem.load(0x0000, &[0xa0]); // AND B
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0xf0);
+        assert!(!cpu.f.z());
+        assert!(!cpu.f.n());
+        assert!(cpu.f.h());
+        assert!(!cpu.f.c());
+    }
+
+    #[test]
+    fn xor_a_a_zeroes_register() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0x42;
+        mem.load(0x0000, &[0xaf]); // XOR A
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0x00);
+        assert!(cpu.f.z());
+        assert!(!cpu.f.n());
+        assert!(!cpu.f.h());
+        assert!(!cpu.f.c());
+    }
+
+    #[test]
+    fn or_a_b_combines_bits() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0xf0;
+        cpu.b = 0x0f;
+        mem.load(0x0000, &[0xb0]); // OR B
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0xff);
+        assert!(!cpu.f.z());
+        assert!(!cpu.f.h());
+        assert!(!cpu.f.c());
+    }
+
+    #[test]
+    fn cp_a_b_does_not_modify_a() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0x10;
+        cpu.b = 0x20;
+        mem.load(0x0000, &[0xb8]); // CP B
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0x10);
+        assert!(!cpu.f.z());
+        assert!(cpu.f.n());
+        assert!(cpu.f.c()); // a < b
+    }
+
+    #[test]
+    fn cp_a_a_sets_zero() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0x42;
+        mem.load(0x0000, &[0xbf]); // CP A
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0x42);
+        assert!(cpu.f.z());
+        assert!(cpu.f.n());
+    }
+
+    #[test]
+    fn alu_indirect_hl_takes_8_cycles() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0x10;
+        cpu.set_hl(0xc000);
+        mem.write8(0xc000, 0x20);
+        mem.load(0x0000, &[0x86]); // ADD A, (HL)
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0x30);
+        assert_eq!(cycles, 8);
     }
 }
