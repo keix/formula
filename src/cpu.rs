@@ -305,6 +305,19 @@ impl Cpu {
         16
     }
 
+    fn add_sp_e(&mut self, e: i8) -> u16 {
+        // Flags are computed as if e were an unsigned 8-bit addend to SP's low byte.
+        // The 16-bit result uses signed extension. This asymmetry is a SM83 quirk.
+        let sp = self.sp;
+        let e_u = e as u8;
+        let result = sp.wrapping_add_signed(i16::from(e));
+        self.f.set_z(false);
+        self.f.set_n(false);
+        self.f.set_h(((sp & 0xf) + u16::from(e_u & 0xf)) > 0xf);
+        self.f.set_c(((sp & 0xff) + u16::from(e_u)) > 0xff);
+        result
+    }
+
     fn rlc(&mut self, value: u8) -> u8 {
         let result = value.rotate_left(1);
         self.f.set_z(result == 0);
@@ -511,6 +524,13 @@ impl Cpu {
                 self.a = self.rlc(self.a);
                 self.f.set_z(false);
                 4
+            }
+            0x08 => {
+                let nn = self.fetch16(bus);
+                let [hi, lo] = self.sp.to_be_bytes();
+                bus.write8(nn, lo);
+                bus.write8(nn.wrapping_add(1), hi);
+                20
             }
             0x09 => {
                 self.add_hl(self.bc());
@@ -818,6 +838,11 @@ impl Cpu {
                 8
             }
             0xe7 => self.rst(0x0020, bus),
+            0xe8 => {
+                let e = self.fetch8(bus) as i8;
+                self.sp = self.add_sp_e(e);
+                16
+            }
             0xe9 => {
                 self.pc = self.hl();
                 4
@@ -862,6 +887,16 @@ impl Cpu {
                 8
             }
             0xf7 => self.rst(0x0030, bus),
+            0xf8 => {
+                let e = self.fetch8(bus) as i8;
+                let v = self.add_sp_e(e);
+                self.set_hl(v);
+                12
+            }
+            0xf9 => {
+                self.sp = self.hl();
+                8
+            }
             0xfa => {
                 let nn = self.fetch16(bus);
                 self.a = bus.read8(nn);
@@ -1677,6 +1712,98 @@ mod tests {
         assert_eq!(cpu.sp, 0xfffe);
         assert!(cpu.ime);
         assert_eq!(cycles, 16);
+    }
+
+    #[test]
+    fn ld_indirect_nn_sp_writes_little_endian() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.sp = 0x1234;
+        mem.load(0x0000, &[0x08, 0x00, 0xc0]); // LD (0xC000), SP
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(mem.read8(0xc000), 0x34); // low byte
+        assert_eq!(mem.read8(0xc001), 0x12); // high byte
+        assert_eq!(cycles, 20);
+    }
+
+    #[test]
+    fn add_sp_e_positive_offset_half_carry() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.sp = 0x000f;
+        cpu.f.set_z(true); // Z should be cleared
+        mem.load(0x0000, &[0xe8, 0x01]); // ADD SP, 1
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cpu.sp, 0x0010);
+        assert!(!cpu.f.z());
+        assert!(!cpu.f.n());
+        assert!(cpu.f.h()); // (0x0f & 0xf) + (0x01 & 0xf) = 0x10 > 0xf
+        assert!(!cpu.f.c());
+        assert_eq!(cycles, 16);
+    }
+
+    #[test]
+    fn add_sp_e_positive_offset_byte_carry() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.sp = 0x00ff;
+        mem.load(0x0000, &[0xe8, 0x01]); // ADD SP, 1
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.sp, 0x0100);
+        assert!(cpu.f.h());
+        assert!(cpu.f.c()); // 0xff + 0x01 > 0xff
+    }
+
+    #[test]
+    fn add_sp_e_negative_offset_with_carry_from_low_byte_unsigned_add() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.sp = 0x0010;
+        mem.load(0x0000, &[0xe8, 0xff]); // ADD SP, -1
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.sp, 0x000f);
+        // Flag math uses e as unsigned 8-bit:
+        // H: (0x10 & 0xf) + (0xff & 0xf) = 0x0 + 0xf = 0xf, NOT > 0xf, so H = 0
+        assert!(!cpu.f.h());
+        // C: 0x10 + 0xff = 0x10f > 0xff, so C = 1
+        assert!(cpu.f.c());
+    }
+
+    #[test]
+    fn ld_hl_sp_e_does_not_modify_sp() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.sp = 0x0010;
+        mem.load(0x0000, &[0xf8, 0x02]); // LD HL, SP+2
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cpu.hl(), 0x0012);
+        assert_eq!(cpu.sp, 0x0010);
+        assert!(!cpu.f.z());
+        assert!(!cpu.f.n());
+        assert_eq!(cycles, 12);
+    }
+
+    #[test]
+    fn ld_sp_hl_copies_hl_to_sp() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_hl(0x1234);
+        mem.load(0x0000, &[0xf9]); // LD SP, HL
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cpu.sp, 0x1234);
+        assert_eq!(cycles, 8);
     }
 
     #[test]
