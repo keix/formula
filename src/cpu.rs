@@ -794,10 +794,19 @@ impl Cpu {
                 8
             }
             0xdf => self.rst(0x0018, bus),
+            0xe0 => {
+                let n = self.fetch8(bus);
+                bus.write8(0xff00 + u16::from(n), self.a);
+                12
+            }
             0xe1 => {
                 let v = self.pop16(bus);
                 self.set_hl(v);
                 12
+            }
+            0xe2 => {
+                bus.write8(0xff00 + u16::from(self.c), self.a);
+                8
             }
             0xe5 => {
                 self.push16(bus, self.hl());
@@ -813,16 +822,30 @@ impl Cpu {
                 self.pc = self.hl();
                 4
             }
+            0xea => {
+                let nn = self.fetch16(bus);
+                bus.write8(nn, self.a);
+                16
+            }
             0xee => {
                 let n = self.fetch8(bus);
                 self.xor_a(n);
                 8
             }
             0xef => self.rst(0x0028, bus),
+            0xf0 => {
+                let n = self.fetch8(bus);
+                self.a = bus.read8(0xff00 + u16::from(n));
+                12
+            }
             0xf1 => {
                 let v = self.pop16(bus);
                 self.set_af(v);
                 12
+            }
+            0xf2 => {
+                self.a = bus.read8(0xff00 + u16::from(self.c));
+                8
             }
             0xf3 => {
                 self.ime = false;
@@ -839,6 +862,11 @@ impl Cpu {
                 8
             }
             0xf7 => self.rst(0x0030, bus),
+            0xfa => {
+                let nn = self.fetch16(bus);
+                self.a = bus.read8(nn);
+                16
+            }
             0xfb => {
                 self.ime_delay = 2;
                 4
@@ -1648,6 +1676,66 @@ mod tests {
         assert_eq!(cpu.pc, 0x1234);
         assert_eq!(cpu.sp, 0xfffe);
         assert!(cpu.ime);
+        assert_eq!(cycles, 16);
+    }
+
+    #[test]
+    fn ldh_n_a_and_ldh_a_n_use_ff00_offset() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0xab;
+        mem.load(0x0000, &[0xe0, 0x40]); // LDH (0x40), A → 0xFF40
+
+        let cycles = cpu.step(&mut mem);
+        assert_eq!(mem.read8(0xff40), 0xab);
+        assert_eq!(cycles, 12);
+        assert_eq!(cpu.pc, 0x0002);
+
+        cpu.a = 0;
+        mem.write8(0xff40, 0x66);
+        mem.load(0x0002, &[0xf0, 0x40]); // LDH A, (0x40)
+        let cycles = cpu.step(&mut mem);
+        assert_eq!(cpu.a, 0x66);
+        assert_eq!(cycles, 12);
+    }
+
+    #[test]
+    fn ld_indirect_c_uses_ff00_plus_c_register() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0xab;
+        cpu.c = 0x40;
+        mem.load(0x0000, &[0xe2]); // LD (C), A → 0xFF40
+
+        let cycles = cpu.step(&mut mem);
+        assert_eq!(mem.read8(0xff40), 0xab);
+        assert_eq!(cycles, 8);
+
+        cpu.a = 0;
+        mem.write8(0xff40, 0x66);
+        mem.load(0x0001, &[0xf2]); // LD A, (C)
+        let cycles = cpu.step(&mut mem);
+        assert_eq!(cpu.a, 0x66);
+        assert_eq!(cycles, 8);
+    }
+
+    #[test]
+    fn ld_indirect_nn_roundtrips_through_absolute_address() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.a = 0xab;
+        mem.load(0x0000, &[0xea, 0x00, 0xc0]); // LD (0xC000), A
+
+        let cycles = cpu.step(&mut mem);
+        assert_eq!(mem.read8(0xc000), 0xab);
+        assert_eq!(cycles, 16);
+        assert_eq!(cpu.pc, 0x0003);
+
+        cpu.a = 0;
+        mem.write8(0xc000, 0x66);
+        mem.load(0x0003, &[0xfa, 0x00, 0xc0]); // LD A, (0xC000)
+        let cycles = cpu.step(&mut mem);
+        assert_eq!(cpu.a, 0x66);
         assert_eq!(cycles, 16);
     }
 
