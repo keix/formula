@@ -2,7 +2,12 @@
 
 
 A Game Boy emulator written in Rust.  
-Status: **work in progress.** The bus and 64 KB memory are in place; the CPU is not implemented yet.
+Status: **work in progress.** Core CPU execution, memory, MMU, and basic cartridge support are in place.
+
+## Architecture
+
+Stable architectural notes live in [docs/formula-architecture.md](docs/formula-architecture.md).
+Working design notes and implementation decisions remain in `design.md`.
 
 ## Build
 
