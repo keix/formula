@@ -82,6 +82,12 @@ impl Cpu {
         byte
     }
 
+    fn fetch16(&mut self, bus: &mut impl Bus) -> u16 {
+        let lo = self.fetch8(bus);
+        let hi = self.fetch8(bus);
+        u16::from_be_bytes([hi, lo])
+    }
+
     fn push16(&mut self, bus: &mut impl Bus, value: u16) {
         let [hi, lo] = value.to_be_bytes();
         self.sp = self.sp.wrapping_sub(1);
@@ -360,6 +366,11 @@ impl Cpu {
         let opcode = self.fetch8(bus);
         let cycles = match opcode {
             0x00 => 4,
+            0x01 => {
+                let v = self.fetch16(bus);
+                self.set_bc(v);
+                12
+            }
             0x06 => {
                 self.b = self.fetch8(bus);
                 8
@@ -367,6 +378,11 @@ impl Cpu {
             0x0e => {
                 self.c = self.fetch8(bus);
                 8
+            }
+            0x11 => {
+                let v = self.fetch16(bus);
+                self.set_de(v);
+                12
             }
             0x16 => {
                 self.d = self.fetch8(bus);
@@ -376,6 +392,11 @@ impl Cpu {
                 self.e = self.fetch8(bus);
                 8
             }
+            0x21 => {
+                let v = self.fetch16(bus);
+                self.set_hl(v);
+                12
+            }
             0x26 => {
                 self.h = self.fetch8(bus);
                 8
@@ -383,6 +404,10 @@ impl Cpu {
             0x2e => {
                 self.l = self.fetch8(bus);
                 8
+            }
+            0x31 => {
+                self.sp = self.fetch16(bus);
+                12
             }
             0x3e => {
                 self.a = self.fetch8(bus);
@@ -420,17 +445,53 @@ impl Cpu {
                 }
                 if src == 6 { 8 } else { 4 }
             }
+            0xc1 => {
+                let v = self.pop16(bus);
+                self.set_bc(v);
+                12
+            }
+            0xc5 => {
+                self.push16(bus, self.bc());
+                16
+            }
             0xcb => self.step_cb(bus),
+            0xd1 => {
+                let v = self.pop16(bus);
+                self.set_de(v);
+                12
+            }
+            0xd5 => {
+                self.push16(bus, self.de());
+                16
+            }
             0xd9 => {
                 self.pc = self.pop16(bus);
                 self.ime = true;
                 self.ime_delay = 0;
                 16
             }
+            0xe1 => {
+                let v = self.pop16(bus);
+                self.set_hl(v);
+                12
+            }
+            0xe5 => {
+                self.push16(bus, self.hl());
+                16
+            }
+            0xf1 => {
+                let v = self.pop16(bus);
+                self.set_af(v);
+                12
+            }
             0xf3 => {
                 self.ime = false;
                 self.ime_delay = 0;
                 4
+            }
+            0xf5 => {
+                self.push16(bus, self.af());
+                16
             }
             0xfb => {
                 self.ime_delay = 2;
@@ -1236,6 +1297,83 @@ mod tests {
         assert_eq!(cpu.sp, 0xfffe);
         assert!(cpu.ime);
         assert_eq!(cycles, 16);
+    }
+
+    #[test]
+    fn ld_rr_nn_loads_all_pairs() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        mem.load(
+            0x0000,
+            &[
+                0x01, 0x34, 0x12, // LD BC, 0x1234
+                0x11, 0x78, 0x56, // LD DE, 0x5678
+                0x21, 0xbc, 0x9a, // LD HL, 0x9ABC
+                0x31, 0xfe, 0xff, // LD SP, 0xFFFE
+            ],
+        );
+
+        for _ in 0..4 {
+            assert_eq!(cpu.step(&mut mem), 12);
+        }
+
+        assert_eq!(cpu.bc(), 0x1234);
+        assert_eq!(cpu.de(), 0x5678);
+        assert_eq!(cpu.hl(), 0x9abc);
+        assert_eq!(cpu.sp, 0xfffe);
+        assert_eq!(cpu.pc, 0x000c);
+    }
+
+    #[test]
+    fn push_then_pop_roundtrips_register_pair() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.sp = 0xfffe;
+        cpu.set_bc(0xabcd);
+        cpu.set_de(0x1234);
+        mem.load(0x0000, &[0xc5, 0xd1]); // PUSH BC; POP DE
+
+        assert_eq!(cpu.step(&mut mem), 16); // PUSH BC
+        assert_eq!(cpu.sp, 0xfffc);
+        assert_eq!(mem.read8(0xfffc), 0xcd); // low at SP
+        assert_eq!(mem.read8(0xfffd), 0xab); // high at SP+1
+
+        assert_eq!(cpu.step(&mut mem), 12); // POP DE
+        assert_eq!(cpu.sp, 0xfffe);
+        assert_eq!(cpu.de(), 0xabcd);
+    }
+
+    #[test]
+    fn pop_af_masks_lower_nibble_of_f() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.sp = 0xfffc;
+        mem.write8(0xfffc, 0xff); // F = 0xFF on the stack
+        mem.write8(0xfffd, 0x42); // A = 0x42
+        mem.load(0x0000, &[0xf1]); // POP AF
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.a, 0x42);
+        assert_eq!(cpu.f.bits(), 0xf0); // low nibble masked
+        assert_eq!(cpu.sp, 0xfffe);
+    }
+
+    #[test]
+    fn push_af_writes_f_with_low_nibble_zero() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.sp = 0xfffe;
+        cpu.a = 0x12;
+        cpu.f.set_z(true);
+        cpu.f.set_c(true);
+        mem.load(0x0000, &[0xf5]); // PUSH AF
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.sp, 0xfffc);
+        assert_eq!(mem.read8(0xfffc), 0x90); // F = Z+C = 0x90
+        assert_eq!(mem.read8(0xfffd), 0x12); // A
     }
 
     #[test]
