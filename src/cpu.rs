@@ -231,6 +231,17 @@ impl Cpu {
         if idx == 6 { 12 } else { 4 }
     }
 
+    fn add_hl(&mut self, value: u16) {
+        let hl = self.hl();
+        let (result, carry) = hl.overflowing_add(value);
+        let half = ((hl & 0x0fff) + (value & 0x0fff)) > 0x0fff;
+        self.set_hl(result);
+        // Z preserved
+        self.f.set_n(false);
+        self.f.set_h(half);
+        self.f.set_c(carry);
+    }
+
     fn rlc(&mut self, value: u8) -> u8 {
         let result = value.rotate_left(1);
         self.f.set_z(result == 0);
@@ -438,6 +449,10 @@ impl Cpu {
                 self.f.set_z(false);
                 4
             }
+            0x09 => {
+                self.add_hl(self.bc());
+                8
+            }
             0x0a => {
                 self.a = bus.read8(self.bc());
                 8
@@ -480,6 +495,10 @@ impl Cpu {
                 self.a = self.rl(self.a);
                 self.f.set_z(false);
                 4
+            }
+            0x19 => {
+                self.add_hl(self.de());
+                8
             }
             0x1a => {
                 self.a = bus.read8(self.de());
@@ -524,6 +543,10 @@ impl Cpu {
                 self.daa();
                 4
             }
+            0x29 => {
+                self.add_hl(self.hl());
+                8
+            }
             0x2a => {
                 self.a = bus.read8(self.hl());
                 self.set_hl(self.hl().wrapping_add(1));
@@ -560,11 +583,20 @@ impl Cpu {
             }
             0x34 => self.inc_r(6, bus),
             0x35 => self.dec_r(6, bus),
+            0x36 => {
+                let n = self.fetch8(bus);
+                bus.write8(self.hl(), n);
+                12
+            }
             0x37 => {
                 self.f.set_n(false);
                 self.f.set_h(false);
                 self.f.set_c(true);
                 4
+            }
+            0x39 => {
+                self.add_hl(self.sp);
+                8
             }
             0x3a => {
                 self.a = bus.read8(self.hl());
@@ -1512,6 +1544,103 @@ mod tests {
         assert_eq!(cpu.sp, 0xfffe);
         assert!(cpu.ime);
         assert_eq!(cycles, 16);
+    }
+
+    #[test]
+    fn add_hl_dispatches_to_all_pairs() {
+        // ADD HL, BC
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_hl(0x0100);
+        cpu.set_bc(0x0023);
+        mem.load(0x0000, &[0x09]);
+        assert_eq!(cpu.step(&mut mem), 8);
+        assert_eq!(cpu.hl(), 0x0123);
+
+        // ADD HL, DE
+        cpu.set_hl(0x0100);
+        cpu.set_de(0x0023);
+        cpu.pc = 0;
+        mem.load(0x0000, &[0x19]);
+        cpu.step(&mut mem);
+        assert_eq!(cpu.hl(), 0x0123);
+
+        // ADD HL, HL (doubling)
+        cpu.set_hl(0x1234);
+        cpu.pc = 0;
+        mem.load(0x0000, &[0x29]);
+        cpu.step(&mut mem);
+        assert_eq!(cpu.hl(), 0x2468);
+
+        // ADD HL, SP
+        cpu.set_hl(0x0100);
+        cpu.sp = 0x0023;
+        cpu.pc = 0;
+        mem.load(0x0000, &[0x39]);
+        cpu.step(&mut mem);
+        assert_eq!(cpu.hl(), 0x0123);
+    }
+
+    #[test]
+    fn add_hl_sets_half_carry_on_bit_11_overflow() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_hl(0x0fff);
+        cpu.set_bc(0x0001);
+        mem.load(0x0000, &[0x09]); // ADD HL, BC
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.hl(), 0x1000);
+        assert!(!cpu.f.n());
+        assert!(cpu.f.h());
+        assert!(!cpu.f.c());
+    }
+
+    #[test]
+    fn add_hl_sets_carry_on_bit_15_overflow() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_hl(0xffff);
+        cpu.set_bc(0x0001);
+        mem.load(0x0000, &[0x09]); // ADD HL, BC
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.hl(), 0x0000);
+        assert!(!cpu.f.n());
+        assert!(cpu.f.h()); // 0xFFF + 1 carries from bit 11
+        assert!(cpu.f.c());
+    }
+
+    #[test]
+    fn add_hl_preserves_z_and_clears_n() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_hl(0x0100);
+        cpu.set_bc(0x0023);
+        cpu.f.set_z(true);
+        cpu.f.set_n(true);
+        mem.load(0x0000, &[0x09]);
+
+        cpu.step(&mut mem);
+
+        assert!(cpu.f.z(), "Z must be preserved by ADD HL");
+        assert!(!cpu.f.n());
+    }
+
+    #[test]
+    fn ld_indirect_hl_n_writes_immediate_to_memory() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.set_hl(0xc000);
+        mem.load(0x0000, &[0x36, 0x42]); // LD (HL), 0x42
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cycles, 12);
+        assert_eq!(mem.read8(0xc000), 0x42);
+        assert_eq!(cpu.pc, 0x0002);
     }
 
     #[test]
