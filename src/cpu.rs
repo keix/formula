@@ -13,6 +13,9 @@ pub struct Cpu {
     pub sp: u16,
     pub pc: u16,
     pub halted: bool,
+    pub ime: bool,
+    pub halt_bug: bool,
+    ime_delay: u8,
 }
 
 impl Cpu {
@@ -29,6 +32,9 @@ impl Cpu {
             sp: 0,
             pc: 0,
             halted: false,
+            ime: false,
+            halt_bug: false,
+            ime_delay: 0,
         }
     }
 
@@ -68,8 +74,28 @@ impl Cpu {
 
     fn fetch8(&mut self, bus: &mut impl Bus) -> u8 {
         let byte = bus.read8(self.pc);
-        self.pc = self.pc.wrapping_add(1);
+        if self.halt_bug {
+            self.halt_bug = false;
+        } else {
+            self.pc = self.pc.wrapping_add(1);
+        }
         byte
+    }
+
+    fn push16(&mut self, bus: &mut impl Bus, value: u16) {
+        let [hi, lo] = value.to_be_bytes();
+        self.sp = self.sp.wrapping_sub(1);
+        bus.write8(self.sp, hi);
+        self.sp = self.sp.wrapping_sub(1);
+        bus.write8(self.sp, lo);
+    }
+
+    fn pop16(&mut self, bus: &mut impl Bus) -> u16 {
+        let lo = bus.read8(self.sp);
+        self.sp = self.sp.wrapping_add(1);
+        let hi = bus.read8(self.sp);
+        self.sp = self.sp.wrapping_add(1);
+        u16::from_be_bytes([hi, lo])
     }
 
     fn read_r(&self, idx: u8, bus: &impl Bus) -> u8 {
@@ -293,13 +319,46 @@ impl Cpu {
         }
     }
 
+    fn service_interrupt(&mut self, bus: &mut impl Bus, pending: u8) -> u8 {
+        let bit = pending.trailing_zeros() as u8;
+        let vector = 0x40_u16 + u16::from(bit) * 8;
+
+        self.ime = false;
+        let if_ = bus.read8(0xff0f);
+        bus.write8(0xff0f, if_ & !(1u8 << bit));
+
+        self.push16(bus, self.pc);
+        self.pc = vector;
+
+        20
+    }
+
+    fn tick_ime_delay(&mut self) {
+        if self.ime_delay > 0 {
+            self.ime_delay -= 1;
+            if self.ime_delay == 0 {
+                self.ime = true;
+            }
+        }
+    }
+
     pub fn step(&mut self, bus: &mut impl Bus) -> u8 {
+        let pending = bus.read8(0xff0f) & bus.read8(0xffff) & 0x1f;
+
+        if self.halted && pending != 0 {
+            self.halted = false;
+        }
+
+        if self.ime && pending != 0 {
+            return self.service_interrupt(bus, pending);
+        }
+
         if self.halted {
             return 4;
         }
 
         let opcode = self.fetch8(bus);
-        match opcode {
+        let cycles = match opcode {
             0x00 => 4,
             0x06 => {
                 self.b = self.fetch8(bus);
@@ -330,7 +389,11 @@ impl Cpu {
                 8
             }
             0x76 => {
-                self.halted = true;
+                if !self.ime && pending != 0 {
+                    self.halt_bug = true;
+                } else {
+                    self.halted = true;
+                }
                 4
             }
             0x40..=0x7f => {
@@ -358,8 +421,27 @@ impl Cpu {
                 if src == 6 { 8 } else { 4 }
             }
             0xcb => self.step_cb(bus),
+            0xd9 => {
+                self.pc = self.pop16(bus);
+                self.ime = true;
+                self.ime_delay = 0;
+                16
+            }
+            0xf3 => {
+                self.ime = false;
+                self.ime_delay = 0;
+                4
+            }
+            0xfb => {
+                self.ime_delay = 2;
+                4
+            }
             _ => panic!("unimplemented opcode: {:#04x}", opcode),
-        }
+        };
+
+        self.tick_ime_delay();
+
+        cycles
     }
 }
 
@@ -1009,5 +1091,178 @@ mod tests {
 
         assert_eq!(mem.read8(0xc000), 0xfe);
         assert_eq!(cycles, 16);
+    }
+
+    #[test]
+    fn interrupt_vblank_pushes_pc_and_jumps_to_vector() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.pc = 0x1234;
+        cpu.sp = 0xfffe;
+        cpu.ime = true;
+        mem.write8(0xff0f, 0x01); // VBlank pending
+        mem.write8(0xffff, 0x01); // VBlank enabled
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cycles, 20);
+        assert_eq!(cpu.pc, 0x0040);
+        assert_eq!(cpu.sp, 0xfffc);
+        assert_eq!(mem.read8(0xfffc), 0x34); // low byte
+        assert_eq!(mem.read8(0xfffd), 0x12); // high byte
+        assert_eq!(mem.read8(0xff0f), 0x00); // IF cleared
+        assert!(!cpu.ime);
+    }
+
+    #[test]
+    fn interrupt_priority_picks_lowest_bit() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.pc = 0x1000;
+        cpu.sp = 0xfffe;
+        cpu.ime = true;
+        mem.write8(0xff0f, 0x14); // bit 2 (Timer) + bit 4 (Joypad) pending
+        mem.write8(0xffff, 0xff);
+
+        cpu.step(&mut mem);
+
+        assert_eq!(cpu.pc, 0x0050); // Timer vector
+        assert_eq!(mem.read8(0xff0f), 0x10); // only bit 2 cleared
+    }
+
+    #[test]
+    fn interrupt_not_serviced_when_ime_disabled() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.pc = 0x1000;
+        cpu.ime = false;
+        mem.write8(0xff0f, 0x01);
+        mem.write8(0xffff, 0x01);
+        mem.write8(0x1000, 0x00); // NOP
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cycles, 4); // just NOP
+        assert_eq!(cpu.pc, 0x1001);
+        assert_eq!(mem.read8(0xff0f), 0x01); // IF unchanged
+    }
+
+    #[test]
+    fn halt_wakes_on_pending_with_ime_disabled_then_executes_next() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.pc = 0x1000;
+        cpu.halted = true;
+        cpu.ime = false;
+        mem.write8(0x1000, 0x00); // NOP at PC
+
+        // halted, no pending — idles
+        assert_eq!(cpu.step(&mut mem), 4);
+        assert!(cpu.halted);
+
+        // raise interrupt
+        mem.write8(0xff0f, 0x01);
+        mem.write8(0xffff, 0x01);
+
+        // wake, IME=0 so no service, execute NOP
+        let cycles = cpu.step(&mut mem);
+        assert!(!cpu.halted);
+        assert_eq!(cpu.pc, 0x1001);
+        assert_eq!(cycles, 4);
+    }
+
+    #[test]
+    fn halt_wakes_and_services_with_ime_enabled() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.pc = 0x1000;
+        cpu.sp = 0xfffe;
+        cpu.halted = true;
+        cpu.ime = true;
+        mem.write8(0xff0f, 0x01);
+        mem.write8(0xffff, 0x01);
+
+        let cycles = cpu.step(&mut mem);
+
+        assert!(!cpu.halted);
+        assert_eq!(cpu.pc, 0x0040);
+        assert_eq!(cycles, 20);
+    }
+
+    #[test]
+    fn ei_enables_ime_after_one_instruction_delay() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        mem.load(0x0000, &[0xfb, 0x00, 0x00]); // EI; NOP; NOP
+
+        assert!(!cpu.ime);
+
+        cpu.step(&mut mem); // EI
+        assert!(!cpu.ime, "IME should not be set immediately after EI");
+
+        cpu.step(&mut mem); // NOP, IME still 0 during this instruction
+        assert!(cpu.ime, "IME should be set after the instruction following EI");
+    }
+
+    #[test]
+    fn di_immediately_clears_ime_and_cancels_pending_ei() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.ime = true;
+        mem.load(0x0000, &[0xfb, 0xf3]); // EI; DI
+
+        cpu.step(&mut mem); // EI
+        cpu.step(&mut mem); // DI
+
+        assert!(!cpu.ime);
+        // EI's pending delay should be canceled by DI; one more step shouldn't re-enable.
+        mem.load(0x0002, &[0x00]); // NOP
+        cpu.step(&mut mem);
+        assert!(!cpu.ime);
+    }
+
+    #[test]
+    fn reti_pops_pc_and_enables_ime_immediately() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.sp = 0xfffc;
+        mem.write8(0xfffc, 0x34); // low byte
+        mem.write8(0xfffd, 0x12); // high byte
+        mem.load(0x0000, &[0xd9]); // RETI
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cpu.pc, 0x1234);
+        assert_eq!(cpu.sp, 0xfffe);
+        assert!(cpu.ime);
+        assert_eq!(cycles, 16);
+    }
+
+    #[test]
+    fn halt_bug_repeats_next_opcode_byte() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.pc = 0x1000;
+        cpu.ime = false;
+        mem.write8(0xff0f, 0x01); // pending, but IME=0
+        mem.write8(0xffff, 0x01);
+        mem.write8(0x1000, 0x76); // HALT
+        mem.write8(0x1001, 0x00); // NOP
+
+        // HALT triggers the bug: not halted, halt_bug latched, PC advanced past HALT
+        let cycles = cpu.step(&mut mem);
+        assert!(!cpu.halted);
+        assert!(cpu.halt_bug);
+        assert_eq!(cpu.pc, 0x1001);
+        assert_eq!(cycles, 4);
+
+        // Next fetch reads opcode at 0x1001 but PC stays (bug consumed)
+        cpu.step(&mut mem);
+        assert!(!cpu.halt_bug);
+        assert_eq!(cpu.pc, 0x1001);
+
+        // Subsequent step advances normally
+        cpu.step(&mut mem);
+        assert_eq!(cpu.pc, 0x1002);
     }
 }
