@@ -1,7 +1,6 @@
 # Formula Architecture
 
 This document records the stable architectural assumptions for `formula`.
-It is intended to stay higher level and more durable than implementation notes in `design.md`.
 
 ## Overview
 
