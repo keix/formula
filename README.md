@@ -7,7 +7,6 @@ Status: **work in progress.** Core CPU execution, memory, MMU, and basic cartrid
 ## Architecture
 
 Stable architectural notes live in [docs/formula-architecture.md](docs/formula-architecture.md).
-Working design notes and implementation decisions remain in `design.md`.
 
 ## Build
 
