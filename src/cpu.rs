@@ -856,8 +856,22 @@ impl Cpu {
                 4
             }
             0x76 => {
-                if !self.ime && pending != 0 {
-                    self.halt_bug = true;
+                // Re-sample IE & IF here: the opcode fetch above ticked the
+                // bus 4 cycles, which can have raised a new IF bit (timer
+                // overflow, PPU mode transition, etc.). Blargg's halt_bug
+                // test cares about the pending state *at HALT execution*,
+                // not at the start of the step.
+                let pending_now = bus.read8(0xff0f) & bus.read8(0xffff) & 0x1f;
+                if pending_now != 0 {
+                    if self.ime {
+                        // HALT yields immediately to the pending IRQ. PC
+                        // rewinds so the ISR's return address points at the
+                        // HALT itself — matching real DMG's "re-run HALT
+                        // after RETI" semantics.
+                        self.pc = self.pc.wrapping_sub(1);
+                    } else {
+                        self.halt_bug = true;
+                    }
                 } else {
                     self.halted = true;
                 }
