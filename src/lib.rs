@@ -4,3 +4,5 @@ pub mod cpu;
 pub mod flags;
 pub mod memory;
 pub mod mmu;
+pub mod ppu;
+pub mod timer;
