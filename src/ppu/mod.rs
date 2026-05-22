@@ -12,8 +12,11 @@ const STAT_INT_OAM: u8 = 1 << 5;
 const STAT_INT_VBLANK: u8 = 1 << 4;
 const STAT_INT_HBLANK: u8 = 1 << 3;
 
-// LCD enable bit within the LCDC register.
+// LCDC register bits.
 const LCDC_LCD_ENABLE: u8 = 1 << 7;
+const LCDC_BG_TILE_MAP: u8 = 1 << 3; // 0 = 0x9800-0x9BFF, 1 = 0x9C00-0x9FFF
+const LCDC_TILE_DATA: u8 = 1 << 4; // 0 = signed (base 0x9000), 1 = unsigned (base 0x8000)
+const LCDC_BG_ENABLE: u8 = 1 << 0;
 
 pub struct Ppu {
     pub regs: Registers,
@@ -171,6 +174,13 @@ impl Ppu {
                 PpuMode::HBlank
             };
 
+            // Render the current scanline at the moment we enter HBlank.
+            // Hardware draws pixel-by-pixel through mode 3; we composite
+            // the whole line in one shot at the transition.
+            if self.dots == 80 + 172 && self.regs.ly < 144 {
+                self.render_bg_scanline();
+            }
+
             // STAT IRQ line: rising edge raises IF bit 1 once; subsequent
             // cycles with the line still high do not refire.
             let new_line = self.compute_stat_line();
@@ -180,6 +190,54 @@ impl Ppu {
             self.stat_line = new_line;
         }
         interrupts
+    }
+
+    fn render_bg_scanline(&mut self) {
+        let ly = self.regs.ly as usize;
+
+        // LCDC bit 0: when clear, the BG renders as shade 0 across the line.
+        if (self.regs.lcdc & LCDC_BG_ENABLE) == 0 {
+            for x in 0..WIDTH {
+                self.framebuffer.set_pixel(x, ly, 0);
+            }
+            return;
+        }
+
+        let map_base: u16 = if (self.regs.lcdc & LCDC_BG_TILE_MAP) != 0 {
+            0x9c00
+        } else {
+            0x9800
+        };
+        let unsigned_tile_data = (self.regs.lcdc & LCDC_TILE_DATA) != 0;
+        let bgp = self.regs.bgp;
+
+        let bg_y = self.regs.ly.wrapping_add(self.regs.scy);
+        let tile_row = (bg_y / 8) as u16;
+        let fine_y = (bg_y % 8) as u16;
+
+        for x in 0..WIDTH {
+            let bg_x = (x as u8).wrapping_add(self.regs.scx);
+            let tile_col = (bg_x / 8) as u16;
+            let fine_x = bg_x % 8;
+
+            let tile_index = self.read_vram(map_base + tile_row * 32 + tile_col);
+            let tile_data_addr = if unsigned_tile_data {
+                0x8000 + (tile_index as u16) * 16
+            } else {
+                // Signed addressing: 0x9000 is bank 0, with indices
+                // -128..=-1 mapping back into 0x8800-0x8FFF.
+                (0x9000_i32 + (tile_index as i8 as i32) * 16) as u16
+            };
+
+            let lo = self.read_vram(tile_data_addr + fine_y * 2);
+            let hi = self.read_vram(tile_data_addr + fine_y * 2 + 1);
+
+            let bit = 7 - fine_x;
+            let color_index = (((hi >> bit) & 1) << 1) | ((lo >> bit) & 1);
+            let shade = (bgp >> (color_index * 2)) & 0b11;
+
+            self.framebuffer.set_pixel(x, ly, shade);
+        }
     }
 }
 
@@ -510,5 +568,115 @@ mod tests {
     fn vram_write_above_9fff_panics() {
         let mut ppu = Ppu::new();
         ppu.write_vram(0xa000, 0);
+    }
+
+    // Cycles needed to land on the first HBlank entry (dot 252 of line 0).
+    const TO_HBLANK: u32 = 80 + 172;
+
+    fn ppu_with_bg() -> Ppu {
+        let mut ppu = Ppu::new();
+        // LCD on (bit 7), unsigned tile data at 0x8000 (bit 4), BG on (bit 0).
+        ppu.write(0xff40, 0x91);
+        // Identity BGP: color 0->shade 0, 1->1, 2->2, 3->3.
+        ppu.write(0xff47, 0xe4);
+        ppu
+    }
+
+    #[test]
+    fn bg_renders_solid_shade_three_from_a_full_tile() {
+        let mut ppu = ppu_with_bg();
+        // Tile 0 row 0: both planes 0xFF -> every pixel resolves to color 3.
+        ppu.write_vram(0x8000, 0xff);
+        ppu.write_vram(0x8001, 0xff);
+        // BG map at 0x9800 stays zero, so every map slot picks tile 0.
+
+        ppu.tick(TO_HBLANK);
+
+        let fb = ppu.framebuffer();
+        for x in 0..WIDTH {
+            assert_eq!(fb.pixel(x, 0), 3, "x={x}");
+        }
+    }
+
+    #[test]
+    fn bg_disable_paints_shade_zero_even_when_tile_is_set() {
+        let mut ppu = Ppu::new();
+        // LCD on, BG off.
+        ppu.write(0xff40, LCDC_LCD_ENABLE);
+        ppu.write(0xff47, 0xff); // every color would map to shade 3 if BG ran
+        ppu.write_vram(0x8000, 0xff);
+        ppu.write_vram(0x8001, 0xff);
+
+        ppu.tick(TO_HBLANK);
+
+        let fb = ppu.framebuffer();
+        for x in 0..WIDTH {
+            assert_eq!(fb.pixel(x, 0), 0);
+        }
+    }
+
+    #[test]
+    fn bgp_remaps_color_indices_to_shades() {
+        let mut ppu = ppu_with_bg();
+        // BGP = 0b00_00_00_11: every color index but 0 stays 0, but color
+        // index 0 maps to shade 3. Tile 0 row 0 is all zeros, so every
+        // pixel has color index 0 -> shade 3 after the remap.
+        ppu.write(0xff47, 0b0000_0011);
+
+        ppu.tick(TO_HBLANK);
+
+        let fb = ppu.framebuffer();
+        for x in 0..WIDTH {
+            assert_eq!(fb.pixel(x, 0), 3);
+        }
+    }
+
+    #[test]
+    fn signed_tile_addressing_finds_tile_at_0x9000() {
+        // LCDC.4 = 0 -> tile index is signed; index 0 maps to 0x9000.
+        let mut ppu = Ppu::new();
+        ppu.write(0xff40, LCDC_LCD_ENABLE | LCDC_BG_ENABLE); // bit 4 stays 0
+        ppu.write(0xff47, 0xe4);
+
+        // Tile -1 lives at 0x8FF0; row 0 = all-3 pixels.
+        ppu.write_vram(0x8ff0, 0xff);
+        ppu.write_vram(0x8ff1, 0xff);
+        // Tilemap at 0x9800 stores 0xFF for every cell -> signed index -1.
+        for cell in 0x9800_u16..=0x9bff {
+            ppu.write_vram(cell, 0xff);
+        }
+
+        ppu.tick(TO_HBLANK);
+
+        let fb = ppu.framebuffer();
+        for x in 0..WIDTH {
+            assert_eq!(fb.pixel(x, 0), 3, "x={x}");
+        }
+    }
+
+    #[test]
+    fn scx_scrolls_the_visible_pixels_horizontally() {
+        let mut ppu = ppu_with_bg();
+        // Tile 0: a column at fine_x = 0 only (bit 7 of each row).
+        // lo=0x80, hi=0x80 -> color index 3 only when bit 7 is read.
+        for row in 0..8 {
+            ppu.write_vram(0x8000 + row * 2, 0x80);
+            ppu.write_vram(0x8001 + row * 2, 0x80);
+        }
+
+        ppu.write(0xff43, 0); // SCX = 0
+        ppu.tick(TO_HBLANK);
+        assert_eq!(ppu.framebuffer().pixel(0, 0), 3);
+        assert_eq!(ppu.framebuffer().pixel(1, 0), 0);
+        assert_eq!(ppu.framebuffer().pixel(8, 0), 3); // next tile, fine_x = 0
+
+        // Re-render with SCX = 1 -> the column that was at x=0 now sits at x=-1
+        // (i.e. just off the left edge), and the next tile's column lands at x=7.
+        ppu.regs.ly = 0;
+        ppu.dots = 0;
+        ppu.write(0xff43, 1);
+        ppu.tick(TO_HBLANK);
+        assert_eq!(ppu.framebuffer().pixel(0, 0), 0);
+        assert_eq!(ppu.framebuffer().pixel(7, 0), 3);
     }
 }

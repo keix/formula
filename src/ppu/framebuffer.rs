@@ -15,6 +15,14 @@ impl Framebuffer {
     pub fn as_slice(&self) -> &[u8] {
         &self.pixels
     }
+
+    pub fn pixel(&self, x: usize, y: usize) -> u8 {
+        self.pixels[y * WIDTH + x]
+    }
+
+    pub fn set_pixel(&mut self, x: usize, y: usize, shade: u8) {
+        self.pixels[y * WIDTH + x] = shade;
+    }
 }
 
 impl Default for Framebuffer {
