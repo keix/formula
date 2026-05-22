@@ -531,6 +531,10 @@ impl Cpu {
         }
     }
 
+    /// Execute one instruction (or service one pending interrupt, or
+    /// burn one HALT cycle, or one stall cycle when the CPU has
+    /// locked on an illegal opcode). Returns the number of T-cycles
+    /// the rest of the system should advance by.
     pub fn step(&mut self, bus: &mut impl Bus) -> u8 {
         if self.locked {
             return 4;

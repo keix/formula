@@ -8,9 +8,18 @@
 //! 0x0147 into [`Mbc0`] (type 0x00) or [`Mbc1`] (types 0x01-0x03).
 
 pub trait Cartridge {
+    /// Read from the ROM window 0x0000-0x7FFF (the MBC passes the
+    /// full address, not a bank-relative offset).
     fn read_rom(&self, addr: u16) -> u8;
+    /// Write to the ROM window. On MBC0 this is a no-op; MBCs that
+    /// have bank registers decode the high bits of the address to
+    /// pick which register the value lands in.
     fn write_rom(&mut self, addr: u16, value: u8);
+    /// Read from the external-RAM window 0xA000-0xBFFF. `addr` here
+    /// is **bank-relative** (0..0x1FFF) — the MMU has already
+    /// subtracted 0xA000.
     fn read_ram(&self, addr: u16) -> u8;
+    /// Write to the external-RAM window (bank-relative addr).
     fn write_ram(&mut self, addr: u16, value: u8);
 }
 
@@ -160,6 +169,9 @@ impl Cartridge for Mbc1 {
     }
 }
 
+/// Dispatch on the cartridge header type byte at 0x0147 and return
+/// a boxed [`Cartridge`]. Panics if the type is unsupported or the
+/// ROM is too short to contain the header.
 pub fn load_cartridge(rom: Vec<u8>) -> Box<dyn Cartridge> {
     let mbc_type = *rom
         .get(0x0147)

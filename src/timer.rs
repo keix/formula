@@ -24,6 +24,8 @@ impl Timer {
         }
     }
 
+    /// Read one of DIV / TIMA / TMA / TAC. TAC's upper 5 bits read
+    /// as 1 to match hardware open-bus behaviour.
     pub fn read(&self, addr: u16) -> u8 {
         match addr {
             0xff04 => (self.counter >> 8) as u8,
@@ -34,6 +36,9 @@ impl Timer {
         }
     }
 
+    /// Write one of DIV / TIMA / TMA / TAC. Writing DIV — regardless
+    /// of the value — clears the full 16-bit internal counter, not
+    /// just its high byte.
     pub fn write(&mut self, addr: u16, value: u8) {
         match addr {
             0xff04 => self.counter = 0, // any write to DIV clears the internal counter

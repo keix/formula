@@ -16,6 +16,9 @@ impl Memory {
         Self { data: [0; 0x10000] }
     }
 
+    /// Copy `bytes` into memory starting at `start`. Used by tests to
+    /// seed program code or fixture data; panics if the slice would
+    /// run past the end of the address space.
     pub fn load(&mut self, start: u16, bytes: &[u8]) {
         let start = start as usize;
         let end = start + bytes.len();

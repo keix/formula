@@ -42,6 +42,9 @@ impl Joypad {
         }
     }
 
+    /// Synthesise the joypad register byte for `addr` (must be 0xFF00).
+    /// Bits 7..6 are hardwired high, 5..4 mirror the last CPU write,
+    /// and 3..0 are active-low for the buttons on the selected row(s).
     pub fn read(&self, addr: u16) -> u8 {
         match addr {
             0xff00 => {
@@ -84,6 +87,8 @@ impl Joypad {
         }
     }
 
+    /// Latch the row-select bits (5..4) at `addr` (must be 0xFF00).
+    /// Other bits are ignored — they're hardware-driven on read.
     pub fn write(&mut self, addr: u16, value: u8) {
         match addr {
             // Only bits 5..4 are writable; the rest are read-only on DMG.
@@ -103,6 +108,9 @@ impl Joypad {
         self.pressed = new_state;
     }
 
+    /// Consume the pending-interrupt flag. Returns true once per
+    /// released -> pressed transition; subsequent calls return false
+    /// until the next fresh press.
     pub fn take_interrupt(&mut self) -> bool {
         let pending = self.interrupt_pending;
         self.interrupt_pending = false;

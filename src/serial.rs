@@ -33,6 +33,8 @@ impl Serial {
         }
     }
 
+    /// Read SB (0xFF01) or SC (0xFF02). Bit 7 of SC reflects an
+    /// in-flight transfer; bits 6..1 are hardwired high on DMG.
     pub fn read(&self, addr: u16) -> u8 {
         match addr {
             0xff01 => self.sb,
@@ -42,6 +44,10 @@ impl Serial {
         }
     }
 
+    /// Write SB or SC. Writing `0x81` to SC starts an internal-clock
+    /// transfer that takes 8 * 512 T-cycles to complete; writing
+    /// `0x80` (external clock) latches the start bit but never
+    /// completes without a link partner.
     pub fn write(&mut self, addr: u16, value: u8) {
         match addr {
             0xff01 => self.sb = value,
@@ -82,6 +88,8 @@ impl Serial {
         raise
     }
 
+    /// Take ownership of every byte the CPU has shipped via SB/SC
+    /// since the last call. The runner drains this into stdout.
     pub fn drain_output(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.output)
     }

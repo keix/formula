@@ -56,10 +56,14 @@ impl Flags {
         self.0 &= 0xf0;
     }
 
+    /// Raw byte view, e.g. for pushing to the stack via `AF`.
     pub fn bits(self) -> u8 {
         self.0
     }
 
+    /// Build flags from a raw byte (e.g. popped from the stack). The
+    /// low nibble is masked off to preserve the hardware invariant
+    /// that bits 3..0 of F are wired to zero.
     pub fn from_bits(bits: u8) -> Self {
         Self(bits & 0xf0)
     }

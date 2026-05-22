@@ -114,6 +114,8 @@ impl Mmu {
         std::mem::take(&mut self.frame_ready)
     }
 
+    /// Borrow the PPU's framebuffer so the runner can blit it without
+    /// reaching through the MMU into the PPU directly.
     pub fn framebuffer(&self) -> &Framebuffer {
         self.ppu.framebuffer()
     }

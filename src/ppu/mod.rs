@@ -90,6 +90,9 @@ impl Ppu {
         }
     }
 
+    /// Read VRAM at `addr` (must be 0x8000-0x9FFF). The MMU routes
+    /// the VRAM window through here so the PPU is the single source
+    /// of truth for tile data and tilemaps.
     pub fn read_vram(&self, addr: u16) -> u8 {
         match addr {
             0x8000..=0x9fff => self.vram[(addr - 0x8000) as usize],
@@ -97,6 +100,7 @@ impl Ppu {
         }
     }
 
+    /// Write VRAM at `addr` (must be 0x8000-0x9FFF).
     pub fn write_vram(&mut self, addr: u16, value: u8) {
         match addr {
             0x8000..=0x9fff => self.vram[(addr - 0x8000) as usize] = value,
@@ -104,6 +108,8 @@ impl Ppu {
         }
     }
 
+    /// Read OAM at `addr` (must be 0xFE00-0xFE9F). The 40 sprite
+    /// entries (4 bytes each) live here; OAM DMA targets this region.
     pub fn read_oam(&self, addr: u16) -> u8 {
         match addr {
             0xfe00..=0xfe9f => self.oam[(addr - 0xfe00) as usize],
@@ -111,6 +117,7 @@ impl Ppu {
         }
     }
 
+    /// Write OAM at `addr` (must be 0xFE00-0xFE9F).
     pub fn write_oam(&mut self, addr: u16, value: u8) {
         match addr {
             0xfe00..=0xfe9f => self.oam[(addr - 0xfe00) as usize] = value,
@@ -118,14 +125,19 @@ impl Ppu {
         }
     }
 
+    /// Current pipeline mode (OAM Search / Drawing / HBlank / VBlank).
     pub fn mode(&self) -> PpuMode {
         self.mode
     }
 
+    /// The fully composited framebuffer for the most recent frame.
     pub fn framebuffer(&self) -> &Framebuffer {
         &self.framebuffer
     }
 
+    /// Read an LCD register (must be 0xFF40-0xFF4B, except 0xFF46
+    /// which the MMU services). STAT, LY=LYC coincidence, and the
+    /// mode bits are synthesised from current internal state.
     pub fn read(&self, addr: u16) -> u8 {
         match addr {
             0xff40 => self.regs.lcdc,
@@ -143,6 +155,9 @@ impl Ppu {
         }
     }
 
+    /// Write an LCD register. LCDC has its own setter (resetting
+    /// PPU state on LCD disable); STAT masks the read-only mode and
+    /// coincidence bits; LY is a write-to-zero register on DMG.
     pub fn write(&mut self, addr: u16, value: u8) {
         match addr {
             0xff40 => self.write_lcdc(value),

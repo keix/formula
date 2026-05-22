@@ -18,14 +18,20 @@ impl Framebuffer {
         }
     }
 
+    /// Whole framebuffer as a row-major slice of 2-bit shades. The
+    /// runner reads this once per VBlank to blit to the window.
     pub fn as_slice(&self) -> &[u8] {
         &self.pixels
     }
 
+    /// Read the shade at `(x, y)`. Panics if either coordinate is
+    /// out of range — callers must clip first.
     pub fn pixel(&self, x: usize, y: usize) -> u8 {
         self.pixels[y * WIDTH + x]
     }
 
+    /// Write a shade (0..=3) at `(x, y)`. Same bounds contract as
+    /// [`Framebuffer::pixel`].
     pub fn set_pixel(&mut self, x: usize, y: usize, shade: u8) {
         self.pixels[y * WIDTH + x] = shade;
     }
