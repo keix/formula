@@ -679,4 +679,165 @@ mod tests {
         assert_eq!(ppu.framebuffer().pixel(0, 0), 0);
         assert_eq!(ppu.framebuffer().pixel(7, 0), 3);
     }
+
+    // ----- mid-frame LCDC timing -----
+    //
+    // dmg-acid2 swaps LCDC bits during STAT IRQs to test that each scanline
+    // observes the LCDC value in effect at the moment the line is drawn.
+    // Our renderer samples LCDC at HBlank entry (dot 252), so a write that
+    // lands anywhere in dots 0..252 must affect THIS line, and a write
+    // during HBlank (dots 252..456) must affect the NEXT line.
+
+    fn ppu_with_solid_bg_tile() -> Ppu {
+        let mut ppu = ppu_with_bg();
+        // Every row of tile 0 is full color 3 so any LY in this map gives 3.
+        for offset in 0..16 {
+            ppu.write_vram(0x8000 + offset, 0xff);
+        }
+        ppu
+    }
+
+    #[test]
+    fn lcdc_change_during_oam_search_affects_this_line() {
+        let mut ppu = ppu_with_solid_bg_tile();
+        ppu.tick(40); // mid OAM Search
+        ppu.write(0xff40, 0x80); // disable BG (keep LCD on)
+        ppu.tick(TO_HBLANK - 40);
+        assert_eq!(ppu.framebuffer().pixel(0, 0), 0);
+    }
+
+    #[test]
+    fn lcdc_change_during_drawing_affects_this_line() {
+        let mut ppu = ppu_with_solid_bg_tile();
+        ppu.tick(150); // mid Drawing
+        ppu.write(0xff40, 0x80);
+        ppu.tick(TO_HBLANK - 150);
+        assert_eq!(ppu.framebuffer().pixel(0, 0), 0);
+    }
+
+    #[test]
+    fn lcdc_change_during_hblank_affects_next_line_only() {
+        let mut ppu = ppu_with_solid_bg_tile();
+        ppu.tick(TO_HBLANK); // line 0 rendered with BG on
+        assert_eq!(ppu.framebuffer().pixel(0, 0), 3);
+
+        // Now in HBlank of line 0. Disable BG before the next line draws.
+        ppu.write(0xff40, 0x80);
+
+        // Finish line 0's HBlank + line 1's OAM + Drawing -> HBlank entry of line 1.
+        ppu.tick(456 - TO_HBLANK + TO_HBLANK);
+
+        // Line 0 was already drawn before the change, so it stays solid 3;
+        // line 1 reflects the change.
+        assert_eq!(ppu.framebuffer().pixel(0, 0), 3, "line 0 was finalised before the change");
+        assert_eq!(ppu.framebuffer().pixel(0, 1), 0, "line 1 sees BG disabled");
+    }
+
+    #[test]
+    fn lcdc_tile_data_area_toggle_between_lines_picks_up_new_tile_source() {
+        // Mirror what dmg-acid2 does at LY_30/LY_38: flip LCDC.4 between
+        // unsigned ($8000) and signed ($9000) addressing per scanline.
+        let mut ppu = ppu_with_bg();
+        // Tile 0 in the $8000 (unsigned) bank: full color 3.
+        for offset in 0..16 {
+            ppu.write_vram(0x8000 + offset, 0xff);
+        }
+        // Tile at signed index 0 lives at $9000: full color 1 instead.
+        for offset in 0..16 {
+            ppu.write_vram(0x9000 + offset, if offset % 2 == 0 { 0xff } else { 0x00 });
+        }
+        // Identity BGP keeps color 1 -> shade 1 and color 3 -> shade 3.
+
+        // Line 0: unsigned addressing -> shade 3.
+        ppu.tick(TO_HBLANK);
+        assert_eq!(ppu.framebuffer().pixel(0, 0), 3);
+
+        // Flip LCDC.4 off during HBlank: line 1 should fall back to signed -> shade 1.
+        ppu.write(0xff40, LCDC_LCD_ENABLE | LCDC_BG_ENABLE); // bit 4 clear
+        ppu.tick(456 - TO_HBLANK + TO_HBLANK);
+        assert_eq!(ppu.framebuffer().pixel(0, 1), 1, "signed addressing now picks tile at $9000");
+
+        // Flip back during line 1's HBlank: line 2 returns to shade 3.
+        ppu.write(0xff40, 0x91);
+        ppu.tick(456 - TO_HBLANK + TO_HBLANK);
+        assert_eq!(ppu.framebuffer().pixel(0, 2), 3);
+    }
+
+    #[test]
+    fn scy_change_during_hblank_affects_next_line() {
+        // Build a tilemap whose row 1 differs from row 0: row 0 tile is solid
+        // color 3, row 1 tile is solid color 1. Changing SCY between lines
+        // should shift which BG row is sampled.
+        let mut ppu = ppu_with_bg();
+        // Tile 0 -> color 3.
+        for offset in 0..16 {
+            ppu.write_vram(0x8000 + offset, 0xff);
+        }
+        // Tile 1 -> color 1 (plane lo only).
+        for offset in 0..16 {
+            ppu.write_vram(0x8010 + offset, if offset % 2 == 0 { 0xff } else { 0x00 });
+        }
+        // BG map row 0: tile 0 everywhere (default zeros).
+        // BG map row 1 (cells $9820..$983F): tile 1.
+        for cell in 0x9820_u16..0x9840 {
+            ppu.write_vram(cell, 1);
+        }
+
+        // Line 0 with SCY=0: reads BG row 0 -> tile 0 -> shade 3.
+        ppu.tick(TO_HBLANK);
+        assert_eq!(ppu.framebuffer().pixel(0, 0), 3);
+
+        // During HBlank, push SCY to 8 so line 1 will read BG row 1.
+        ppu.write(0xff42, 8);
+        ppu.tick(456 - TO_HBLANK + TO_HBLANK);
+        assert_eq!(ppu.framebuffer().pixel(0, 1), 1, "line 1 should now see BG row 1");
+    }
+
+    #[test]
+    fn bgp_change_during_hblank_affects_next_line_only() {
+        // Tile 0 row 0 = color 3 (both planes 0xFF). The pixel shade
+        // therefore depends entirely on BGP's mapping of color 3.
+        let mut ppu = ppu_with_bg();
+        for offset in 0..16 {
+            ppu.write_vram(0x8000 + offset, 0xff);
+        }
+
+        // Identity BGP keeps color 3 -> shade 3.
+        ppu.tick(TO_HBLANK);
+        assert_eq!(ppu.framebuffer().pixel(0, 0), 3);
+
+        // Remap color 3 to shade 0 mid-HBlank.
+        // BGP layout (bits 7..0): c3_c3 c2_c2 c1_c1 c0_c0
+        //   00_11_10_01 = 0x39 -> color 3 -> shade 0
+        ppu.write(0xff47, 0b00_11_10_01);
+        ppu.tick(456 - TO_HBLANK + TO_HBLANK);
+        assert_eq!(ppu.framebuffer().pixel(0, 0), 3, "line 0 sticks at its rendered shade");
+        assert_eq!(ppu.framebuffer().pixel(0, 1), 0, "line 1 picks the new BGP mapping");
+    }
+
+    #[test]
+    fn lcdc_bg_map_toggle_between_lines_picks_up_new_tilemap() {
+        // Mirror LY_80/LY_8F in dmg-acid2: flip LCDC.3 to swap BG maps.
+        let mut ppu = ppu_with_bg();
+        // Tile 0: color 3. Tile 1: color 1.
+        for offset in 0..16 {
+            ppu.write_vram(0x8000 + offset, 0xff);
+        }
+        for offset in 0..16 {
+            ppu.write_vram(0x8010 + offset, if offset % 2 == 0 { 0xff } else { 0x00 });
+        }
+        // BG map at $9800 stays zero (-> tile 0). Map at $9C00 picks tile 1.
+        for cell in 0x9c00_u16..0x9c20 {
+            ppu.write_vram(cell, 1);
+        }
+
+        // Line 0: map $9800 -> tile 0 -> shade 3.
+        ppu.tick(TO_HBLANK);
+        assert_eq!(ppu.framebuffer().pixel(0, 0), 3);
+
+        // Switch to map $9C00 during HBlank.
+        ppu.write(0xff40, 0x91 | LCDC_BG_TILE_MAP);
+        ppu.tick(456 - TO_HBLANK + TO_HBLANK);
+        assert_eq!(ppu.framebuffer().pixel(0, 1), 1, "line 1 reads from the $9C00 map");
+    }
 }
