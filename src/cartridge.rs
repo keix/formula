@@ -149,7 +149,7 @@ pub fn load_cartridge(rom: Vec<u8>) -> Box<dyn Cartridge> {
         .expect("ROM too small to contain a cartridge header");
     match mbc_type {
         0x00 => Box::new(Mbc0::new(rom)),
-        0x01 | 0x02 | 0x03 => Box::new(Mbc1::new(rom)),
+        0x01..=0x03 => Box::new(Mbc1::new(rom)),
         t => panic!("unsupported cartridge type: {:#04x}", t),
     }
 }

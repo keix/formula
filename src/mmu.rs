@@ -9,7 +9,6 @@ pub struct Mmu {
     timer: Timer,
     ppu: Ppu,
     serial: Serial,
-    vram: [u8; 0x2000],
     wram: [u8; 0x2000],
     oam: [u8; 0xa0],
     io: [u8; 0x80],
@@ -24,7 +23,6 @@ impl Mmu {
             timer: Timer::new(),
             ppu: Ppu::new(),
             serial: Serial::new(),
-            vram: [0; 0x2000],
             wram: [0; 0x2000],
             oam: [0; 0xa0],
             io: [0; 0x80],
@@ -59,7 +57,7 @@ impl Bus for Mmu {
     fn read8(&self, addr: u16) -> u8 {
         match addr {
             0x0000..=0x7fff => self.cartridge.read_rom(addr),
-            0x8000..=0x9fff => self.vram[(addr - 0x8000) as usize],
+            0x8000..=0x9fff => self.ppu.read_vram(addr),
             0xa000..=0xbfff => self.cartridge.read_ram(addr - 0xa000),
             0xc000..=0xdfff => self.wram[(addr - 0xc000) as usize],
             0xe000..=0xfdff => self.wram[(addr - 0xe000) as usize],
@@ -77,7 +75,7 @@ impl Bus for Mmu {
     fn write8(&mut self, addr: u16, value: u8) {
         match addr {
             0x0000..=0x7fff => self.cartridge.write_rom(addr, value),
-            0x8000..=0x9fff => self.vram[(addr - 0x8000) as usize] = value,
+            0x8000..=0x9fff => self.ppu.write_vram(addr, value),
             0xa000..=0xbfff => self.cartridge.write_ram(addr - 0xa000, value),
             0xc000..=0xdfff => self.wram[(addr - 0xc000) as usize] = value,
             0xe000..=0xfdff => self.wram[(addr - 0xe000) as usize] = value,

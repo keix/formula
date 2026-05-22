@@ -18,6 +18,7 @@ const LCDC_LCD_ENABLE: u8 = 1 << 7;
 pub struct Ppu {
     pub regs: Registers,
     framebuffer: Framebuffer,
+    vram: [u8; 0x2000],
     mode: PpuMode,
     dots: u16,
     // Cached STAT IRQ line. STAT interrupts fire on the LOW->HIGH transition
@@ -32,9 +33,24 @@ impl Ppu {
         Self {
             regs: Registers::new(),
             framebuffer: Framebuffer::new(),
+            vram: [0; 0x2000],
             mode: PpuMode::OamSearch,
             dots: 0,
             stat_line: false,
+        }
+    }
+
+    pub fn read_vram(&self, addr: u16) -> u8 {
+        match addr {
+            0x8000..=0x9fff => self.vram[(addr - 0x8000) as usize],
+            _ => panic!("PPU: read_vram out of range at {:#06x}", addr),
+        }
+    }
+
+    pub fn write_vram(&mut self, addr: u16, value: u8) {
+        match addr {
+            0x8000..=0x9fff => self.vram[(addr - 0x8000) as usize] = value,
+            _ => panic!("PPU: write_vram out of range at {:#06x}", addr),
         }
     }
 
@@ -471,5 +487,28 @@ mod tests {
     fn ppu_write_just_above_register_window_panics() {
         let mut ppu = Ppu::new();
         ppu.write(0xff4c, 0);
+    }
+
+    #[test]
+    fn vram_roundtrips_through_ppu_directly() {
+        let mut ppu = Ppu::new();
+        ppu.write_vram(0x8000, 0xab);
+        ppu.write_vram(0x9fff, 0xcd);
+        assert_eq!(ppu.read_vram(0x8000), 0xab);
+        assert_eq!(ppu.read_vram(0x9fff), 0xcd);
+    }
+
+    #[test]
+    #[should_panic(expected = "PPU: read_vram out of range")]
+    fn vram_read_below_8000_panics() {
+        let ppu = Ppu::new();
+        let _ = ppu.read_vram(0x7fff);
+    }
+
+    #[test]
+    #[should_panic(expected = "PPU: write_vram out of range")]
+    fn vram_write_above_9fff_panics() {
+        let mut ppu = Ppu::new();
+        ppu.write_vram(0xa000, 0);
     }
 }
