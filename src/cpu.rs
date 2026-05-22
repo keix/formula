@@ -1,3 +1,25 @@
+//! SM83 CPU
+//!
+//! Decodes and executes the DMG instruction set against a [`Bus`].
+//! Owns the register file (A/F/BC/DE/HL/SP/PC), the HALT and IME
+//! state, and a couple of small latches for the HALT bug and the
+//! one-instruction EI delay. Every [`Cpu::step`] returns the T-cycle
+//! cost of the instruction it just ran (or 4 for a HALT cycle, or 20
+//! when it serviced an interrupt) so the MMU can advance the rest
+//! of the system in lockstep.
+//!
+//! Design notes:
+//! - All 256 unprefixed opcodes plus the full CB-prefix block are
+//!   handled. The eleven illegal opcodes (0xD3, 0xDB, 0xDD, 0xE3,
+//!   0xE4, 0xEB, 0xEC, 0xED, 0xF4, 0xFC, 0xFD) flip `locked` instead
+//!   of panicking — matching the hardware quirk where the CPU bus-
+//!   stalls forever and giving the binary a clean exit path.
+//! - Interrupt servicing is the standard 20 T-cycles (push PC, jump
+//!   to vector, clear IF and IME). The HALT bug is modelled by the
+//!   `halt_bug` flag: if HALT executes with IME=0 and a pending
+//!   interrupt, the next opcode fetch reads the byte at PC twice.
+//! - EI takes one instruction to enable IME (`ime_delay`).
+
 use crate::bus::Bus;
 use crate::flags::Flags;
 

@@ -1,3 +1,9 @@
+//! 160x144 framebuffer of 2-bit DMG shades.
+//!
+//! Each pixel is one of {0, 1, 2, 3}; the host-side palette mapping
+//! lives in the binary. The PPU writes into this every scanline and
+//! the binary blits it to the window at VBlank.
+
 pub const WIDTH: usize = 160;
 pub const HEIGHT: usize = 144;
 

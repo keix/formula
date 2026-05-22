@@ -1,3 +1,12 @@
+//! Joypad register at 0xFF00.
+//!
+//! Tracks which of the eight buttons the host considers pressed and
+//! re-creates the active-low DMG wire format on read by ANDing the
+//! pressed-button bitmask against whichever of the two scan rows the
+//! CPU has selected (bits 5..4 of the register, written by the game).
+//! The internal interrupt latch raises IF bit 4 on every released ->
+//! pressed transition; holding a button does not refire it.
+
 // Button bitmask. The values are arbitrary — the joypad layout on the wire
 // is reconstructed in Joypad::read by combining state with the active
 // selection lines.

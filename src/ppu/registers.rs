@@ -1,3 +1,9 @@
+//! Memory-mapped PPU registers (0xFF40-0xFF4B except DMA).
+//!
+//! `stat_select` holds only the writable STAT bits (6..3); the mode
+//! and coincidence bits are synthesised on read. DMA (0xFF46) lives
+//! on the MMU because the transfer needs bus access.
+
 pub struct Registers {
     pub lcdc: u8,
     pub(super) stat_select: u8,

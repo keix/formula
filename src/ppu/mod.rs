@@ -1,3 +1,29 @@
+//! Picture Processing Unit
+//!
+//! Owns VRAM, OAM, the BG/Window/Sprite registers and the framebuffer
+//! the binary blits to screen. `tick(cycles)` advances the dot counter,
+//! cycles through OAM Search / Drawing / HBlank / VBlank, raises
+//! VBlank and STAT IRQs through the rising-edge of the STAT line, and
+//! returns the IF bits it wants set so the MMU can OR them in.
+//!
+//! Design notes:
+//! - Rendering is **scanline-coherent**: at the moment the line
+//!   transitions Drawing -> HBlank (dot 252 of LY < 144) we composite
+//!   the whole line in one shot — BG first, then Window over it, then
+//!   sprites with priority / transparency. Real hardware paints
+//!   pixel-by-pixel during Drawing; this is the practical shortcut
+//!   that lets dmg-acid2 hit pixel-perfect parity while keeping the
+//!   model simple. Per-scanline state (BG color index for sprite
+//!   priority, current LCDC/SCX/SCY/BGP samples) all reads from "the
+//!   value at HBlank entry" — so mid-line writes during Drawing
+//!   affect this line, and writes during HBlank affect the next.
+//! - The window has its own internal line counter (`wly`) that only
+//!   advances on lines where the window draws; it resets at the top
+//!   of every frame and when the LCD turns off, matching real DMG.
+//! - LCDC.7 (LCD enable) is a master gate: turning it off resets LY /
+//!   dots / mode / STAT line / wly, and tick() short-circuits until
+//!   it's re-enabled.
+
 mod framebuffer;
 mod mode;
 mod registers;

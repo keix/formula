@@ -1,3 +1,14 @@
+//! Serial port (SB/SC at 0xFF01-0xFF02).
+//!
+//! The transfer model matches real DMG timing: writing the start bit
+//! with the internal clock selected schedules an 8-bit transfer that
+//! takes 8 * 512 T-cycles to drain, at which point SB lands in the
+//! output buffer and IF bit 3 is raised. Writing the start bit with
+//! the external clock instead latches SC and never completes on its
+//! own — there is no emulated link partner to drive the clock, and
+//! that is exactly the "is anyone there?" probe ROMs like Tetris use
+//! to detect a missing link cable.
+
 pub struct Serial {
     sb: u8,
     sc: u8,

@@ -1,3 +1,5 @@
+//! The four PPU pipeline states and their STAT-register encoding.
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum PpuMode {
     HBlank,

@@ -1,3 +1,17 @@
+//! `formula` runner — drives the emulator core against a minifb window.
+//!
+//! Loads a ROM from argv, primes the CPU and MMU to the DMG post-boot-
+//! ROM state, then runs `cpu.step` / `mmu.tick` in a loop. The runner
+//! drains serial bytes to stdout, blits the framebuffer to the window
+//! once per VBlank, and feeds the host keyboard state into the joypad
+//! at the same cadence. A tight self-jump (`PC` unchanged with the
+//! CPU not halted) parks the loop so test ROMs that print their
+//! result and spin can exit cleanly.
+//!
+//! Press `D` while the window is focused to dump OAM + the LCDC /
+//! STAT / palette / IE / IF state to stderr — useful for triaging
+//! ROMs that misbehave silently.
+
 use formula::bus::Bus;
 use formula::cartridge::load_cartridge;
 use formula::cpu::Cpu;

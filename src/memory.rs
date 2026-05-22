@@ -1,3 +1,10 @@
+//! Flat 64 KiB memory backing the CPU's [`Bus`] in unit tests.
+//!
+//! The real address space is decoded by [`crate::mmu::Mmu`]; this
+//! type exists so the CPU can be exercised against a single
+//! contiguous array, with no banks, IO routing, or memory-mapped
+//! subsystems in the way.
+
 use crate::bus::Bus;
 
 pub struct Memory {

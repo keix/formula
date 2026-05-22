@@ -1,3 +1,12 @@
+//! Cartridge surface and MBC implementations.
+//!
+//! [`Cartridge`] is the narrow API the [`crate::mmu::Mmu`] uses to talk
+//! to whatever's behind the connector: ROM reads at 0x0000-0x7FFF go
+//! through `read_rom`, writes hit `write_rom` (the bank registers on
+//! anything other than MBC0), and 0xA000-0xBFFF goes through the RAM
+//! pair. [`load_cartridge`] dispatches on the header type byte at
+//! 0x0147 into [`Mbc0`] (type 0x00) or [`Mbc1`] (types 0x01-0x03).
+
 pub trait Cartridge {
     fn read_rom(&self, addr: u16) -> u8;
     fn write_rom(&mut self, addr: u16, value: u8);
