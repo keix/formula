@@ -1,3 +1,4 @@
+use formula::bus::Bus;
 use formula::cartridge::load_cartridge;
 use formula::cpu::Cpu;
 use formula::flags::Flags;
@@ -7,7 +8,7 @@ use formula::joypad::{
 };
 use formula::mmu::Mmu;
 use formula::ppu::{HEIGHT, WIDTH};
-use minifb::{Key, Scale, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, Scale, Window, WindowOptions};
 use std::env;
 use std::io::Write;
 use std::process::ExitCode;
@@ -23,7 +24,10 @@ const PALETTE: [u32; 4] = [0x9bbc0f, 0x8bac0f, 0x306230, 0x0f380f];
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
-        eprintln!("usage: {} <rom.gb>", args.first().map(String::as_str).unwrap_or("formula"));
+        eprintln!(
+            "usage: {} <rom.gb>",
+            args.first().map(String::as_str).unwrap_or("formula")
+        );
         return ExitCode::from(2);
     }
 
@@ -98,6 +102,14 @@ fn main() -> ExitCode {
             blit_framebuffer(&mut pixel_buffer, mmu.framebuffer().as_slice());
             let _ = window.update_with_buffer(&pixel_buffer, WIDTH, HEIGHT);
             mmu.set_buttons(read_joypad(&window));
+
+            // Press D to snapshot OAM + the palette / LCDC registers to
+            // stderr. Useful when sprites are visibly missing — proves
+            // whether the issue is upstream (no OAM data) or downstream
+            // (data is there but the renderer skips it).
+            if window.is_key_pressed(Key::D, KeyRepeat::No) {
+                dump_state(&mut mmu);
+            }
         }
 
         // Blargg test ROMs (and many homebrew) park themselves in a tight
@@ -169,10 +181,60 @@ fn post_boot_cpu() -> Cpu {
     cpu
 }
 
+fn dump_state(mmu: &mut Mmu) {
+    eprintln!("---");
+    eprintln!(
+        "LCDC={:#04x}  STAT={:#04x}  LY={:3}  LYC={:3}",
+        mmu.read8(0xff40),
+        mmu.read8(0xff41),
+        mmu.read8(0xff44),
+        mmu.read8(0xff45),
+    );
+    eprintln!(
+        "BGP={:#04x}  OBP0={:#04x}  OBP1={:#04x}  SCX={:3} SCY={:3}  WX={:3} WY={:3}",
+        mmu.read8(0xff47),
+        mmu.read8(0xff48),
+        mmu.read8(0xff49),
+        mmu.read8(0xff43),
+        mmu.read8(0xff42),
+        mmu.read8(0xff4b),
+        mmu.read8(0xff4a),
+    );
+    eprintln!(
+        "IE={:#04x}  IF={:#04x}",
+        mmu.read8(0xffff),
+        mmu.read8(0xff0f)
+    );
+    let mut non_zero = 0;
+    for i in 0..40 {
+        let base = 0xfe00 + i * 4;
+        let y = mmu.read8(base);
+        let x = mmu.read8(base + 1);
+        let tile = mmu.read8(base + 2);
+        let attr = mmu.read8(base + 3);
+        if y == 0 && x == 0 && tile == 0 && attr == 0 {
+            continue;
+        }
+        eprintln!(
+            "OAM[{i:02}] Y={y:3}({:+}) X={x:3}({:+}) tile={tile:02X} attr={attr:02X}",
+            y as i16 - 16,
+            x as i16 - 8,
+        );
+        non_zero += 1;
+    }
+    if non_zero == 0 {
+        eprintln!("OAM: all zero");
+    }
+}
+
 fn mmu_write_post_boot_io(mmu: &mut Mmu) {
-    use formula::bus::Bus;
     // Enabling the LCD here lets PPU-driven interrupts (VBlank/STAT) reach
-    // the CPU once Blargg-style ROMs unmask IE.
+    // the CPU once Blargg-style ROMs unmask IE. The palette defaults mirror
+    // what the DMG boot ROM leaves behind — Tetris (and many other DMG
+    // games) never write OBP0/OBP1 themselves and rely on this state, so
+    // skipping them maps every sprite shade to 0 and hides every sprite.
     mmu.write8(0xff40, 0x91); // LCDC
     mmu.write8(0xff47, 0xfc); // BGP
+    mmu.write8(0xff48, 0xff); // OBP0
+    mmu.write8(0xff49, 0xff); // OBP1
 }

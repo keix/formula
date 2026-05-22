@@ -352,7 +352,11 @@ impl Ppu {
         if (self.regs.lcdc & LCDC_OBJ_ENABLE) == 0 {
             return;
         }
-        let sprite_height: i32 = if (self.regs.lcdc & LCDC_OBJ_SIZE) != 0 { 16 } else { 8 };
+        let sprite_height: i32 = if (self.regs.lcdc & LCDC_OBJ_SIZE) != 0 {
+            16
+        } else {
+            8
+        };
         let ly = self.regs.ly as i32;
 
         // Pick the first 10 OAM entries (low index priority on the per-line cap)
@@ -430,7 +434,8 @@ impl Ppu {
                     continue;
                 }
                 let shade = (palette >> (color_index * 2)) & 0b11;
-                self.framebuffer.set_pixel(screen_x as usize, ly_usize, shade);
+                self.framebuffer
+                    .set_pixel(screen_x as usize, ly_usize, shade);
             }
         }
     }
@@ -619,7 +624,11 @@ mod tests {
             total |= ppu.tick(1);
         }
         assert_eq!(total & 0x02, 0, "STAT must stay quiet");
-        assert_eq!(total & 0x01, 0x01, "but VBlank IF still fires independently");
+        assert_eq!(
+            total & 0x01,
+            0x01,
+            "but VBlank IF still fires independently"
+        );
     }
 
     #[test]
@@ -699,7 +708,10 @@ mod tests {
     #[test]
     fn stat_interrupt_stays_quiet_while_lcd_is_off() {
         let mut ppu = ppu_on();
-        ppu.write(0xff41, STAT_INT_OAM | STAT_INT_HBLANK | STAT_INT_VBLANK | STAT_INT_LYC);
+        ppu.write(
+            0xff41,
+            STAT_INT_OAM | STAT_INT_HBLANK | STAT_INT_VBLANK | STAT_INT_LYC,
+        );
         ppu.write(0xff40, 0);
 
         let mut total = 0_u8;
@@ -947,7 +959,11 @@ mod tests {
 
         // Line 0 was already drawn before the change, so it stays solid 3;
         // line 1 reflects the change.
-        assert_eq!(ppu.framebuffer().pixel(0, 0), 3, "line 0 was finalised before the change");
+        assert_eq!(
+            ppu.framebuffer().pixel(0, 0),
+            3,
+            "line 0 was finalised before the change"
+        );
         assert_eq!(ppu.framebuffer().pixel(0, 1), 0, "line 1 sees BG disabled");
     }
 
@@ -973,7 +989,11 @@ mod tests {
         // Flip LCDC.4 off during HBlank: line 1 should fall back to signed -> shade 1.
         ppu.write(0xff40, LCDC_LCD_ENABLE | LCDC_BG_ENABLE); // bit 4 clear
         ppu.tick(456 - TO_HBLANK + TO_HBLANK);
-        assert_eq!(ppu.framebuffer().pixel(0, 1), 1, "signed addressing now picks tile at $9000");
+        assert_eq!(
+            ppu.framebuffer().pixel(0, 1),
+            1,
+            "signed addressing now picks tile at $9000"
+        );
 
         // Flip back during line 1's HBlank: line 2 returns to shade 3.
         ppu.write(0xff40, 0x91);
@@ -1008,7 +1028,11 @@ mod tests {
         // During HBlank, push SCY to 8 so line 1 will read BG row 1.
         ppu.write(0xff42, 8);
         ppu.tick(456 - TO_HBLANK + TO_HBLANK);
-        assert_eq!(ppu.framebuffer().pixel(0, 1), 1, "line 1 should now see BG row 1");
+        assert_eq!(
+            ppu.framebuffer().pixel(0, 1),
+            1,
+            "line 1 should now see BG row 1"
+        );
     }
 
     #[test]
@@ -1029,8 +1053,16 @@ mod tests {
         //   00_11_10_01 = 0x39 -> color 3 -> shade 0
         ppu.write(0xff47, 0b00_11_10_01);
         ppu.tick(456 - TO_HBLANK + TO_HBLANK);
-        assert_eq!(ppu.framebuffer().pixel(0, 0), 3, "line 0 sticks at its rendered shade");
-        assert_eq!(ppu.framebuffer().pixel(0, 1), 0, "line 1 picks the new BGP mapping");
+        assert_eq!(
+            ppu.framebuffer().pixel(0, 0),
+            3,
+            "line 0 sticks at its rendered shade"
+        );
+        assert_eq!(
+            ppu.framebuffer().pixel(0, 1),
+            0,
+            "line 1 picks the new BGP mapping"
+        );
     }
 
     // ----- Window layer -----
@@ -1038,10 +1070,16 @@ mod tests {
     fn ppu_with_bg_and_window() -> Ppu {
         // LCD on, BG on, window on, unsigned tile data, window map at $9C00.
         let mut ppu = Ppu::new();
-        ppu.write(0xff40, LCDC_LCD_ENABLE | LCDC_BG_ENABLE | LCDC_WINDOW_ENABLE
-            | LCDC_TILE_DATA | LCDC_WINDOW_TILE_MAP);
+        ppu.write(
+            0xff40,
+            LCDC_LCD_ENABLE
+                | LCDC_BG_ENABLE
+                | LCDC_WINDOW_ENABLE
+                | LCDC_TILE_DATA
+                | LCDC_WINDOW_TILE_MAP,
+        );
         ppu.write(0xff47, 0xe4); // identity BGP
-        // BG tile 0 -> color 1 (so the window's color 3 stands out on top).
+                                 // BG tile 0 -> color 1 (so the window's color 3 stands out on top).
         for offset in 0..16 {
             ppu.write_vram(0x8000 + offset, if offset % 2 == 0 { 0xff } else { 0x00 });
         }
@@ -1110,8 +1148,10 @@ mod tests {
     #[test]
     fn window_does_not_render_when_lcdc_window_enable_is_clear() {
         let mut ppu = ppu_with_bg_and_window();
-        ppu.write(0xff40, LCDC_LCD_ENABLE | LCDC_BG_ENABLE | LCDC_TILE_DATA
-            | LCDC_WINDOW_TILE_MAP); // bit 5 cleared
+        ppu.write(
+            0xff40,
+            LCDC_LCD_ENABLE | LCDC_BG_ENABLE | LCDC_TILE_DATA | LCDC_WINDOW_TILE_MAP,
+        ); // bit 5 cleared
         ppu.write(0xff4a, 0);
         ppu.write(0xff4b, 7);
         ppu.tick(TO_HBLANK);
@@ -1121,8 +1161,10 @@ mod tests {
     #[test]
     fn window_dies_when_bg_master_is_off() {
         let mut ppu = ppu_with_bg_and_window();
-        ppu.write(0xff40, LCDC_LCD_ENABLE | LCDC_WINDOW_ENABLE | LCDC_TILE_DATA
-            | LCDC_WINDOW_TILE_MAP); // LCDC.0 cleared -> kills both BG and window
+        ppu.write(
+            0xff40,
+            LCDC_LCD_ENABLE | LCDC_WINDOW_ENABLE | LCDC_TILE_DATA | LCDC_WINDOW_TILE_MAP,
+        ); // LCDC.0 cleared -> kills both BG and window
         ppu.write(0xff4a, 0);
         ppu.write(0xff4b, 7);
         ppu.tick(TO_HBLANK);
@@ -1151,7 +1193,11 @@ mod tests {
         ppu.tick(TO_HBLANK + 456 * 3);
         // Line 4: first window line -> uses WLY=0 -> window-map row 0 -> shade 3.
         ppu.tick(456);
-        assert_eq!(ppu.framebuffer().pixel(0, 4), 3, "first window line is map row 0");
+        assert_eq!(
+            ppu.framebuffer().pixel(0, 4),
+            3,
+            "first window line is map row 0"
+        );
         // Lines 5..11: WLY 1..7 still in map row 0 -> shade 3.
         for _ in 0..7 {
             ppu.tick(456);
@@ -1159,7 +1205,11 @@ mod tests {
         assert_eq!(ppu.framebuffer().pixel(0, 11), 3, "WLY 7 still map row 0");
         // Line 12: WLY 8 lands on map row 1 (tile 2 -> shade 0).
         ppu.tick(456);
-        assert_eq!(ppu.framebuffer().pixel(0, 12), 0, "WLY 8 jumps to map row 1");
+        assert_eq!(
+            ppu.framebuffer().pixel(0, 12),
+            0,
+            "WLY 8 jumps to map row 1"
+        );
     }
 
     #[test]
@@ -1184,12 +1234,15 @@ mod tests {
     /// palettes for both BG and OBP0/OBP1.
     fn ppu_with_one_sprite() -> Ppu {
         let mut ppu = Ppu::new();
-        ppu.write(0xff40, LCDC_LCD_ENABLE | LCDC_BG_ENABLE | LCDC_TILE_DATA | LCDC_OBJ_ENABLE);
+        ppu.write(
+            0xff40,
+            LCDC_LCD_ENABLE | LCDC_BG_ENABLE | LCDC_TILE_DATA | LCDC_OBJ_ENABLE,
+        );
         ppu.write(0xff47, 0xe4); // BGP identity
         ppu.write(0xff48, 0xe4); // OBP0 identity
         ppu.write(0xff49, 0xe4); // OBP1 identity
-        // Sprite tile at index 1: row 0 has pixel 0 = color 3, others = 0.
-        // bytes [0]=0x80 [1]=0x80 in tile 1 -> bit 7 is 1 in both planes -> color 3
+                                 // Sprite tile at index 1: row 0 has pixel 0 = color 3, others = 0.
+                                 // bytes [0]=0x80 [1]=0x80 in tile 1 -> bit 7 is 1 in both planes -> color 3
         ppu.write_vram(0x8010, 0x80);
         ppu.write_vram(0x8011, 0x80);
         ppu
@@ -1212,7 +1265,11 @@ mod tests {
         // Sprite's leftmost pixel is color 3 -> shade 3 via OBP0 identity.
         assert_eq!(ppu.framebuffer().pixel(0, 0), 3);
         // The rest of the sprite columns are color 0 (transparent) -> BG.
-        assert_eq!(ppu.framebuffer().pixel(1, 0), 0, "transparent column shows BG (empty -> 0)");
+        assert_eq!(
+            ppu.framebuffer().pixel(1, 0),
+            0,
+            "transparent column shows BG (empty -> 0)"
+        );
     }
 
     #[test]
@@ -1238,7 +1295,11 @@ mod tests {
         place_sprite(&mut ppu, 0, 16, 8, 1, 0);
         ppu.tick(TO_HBLANK);
         assert_eq!(ppu.framebuffer().pixel(0, 0), 3, "sprite color 3 wins");
-        assert_eq!(ppu.framebuffer().pixel(1, 0), 2, "sprite color 0 transparent -> BG color 2");
+        assert_eq!(
+            ppu.framebuffer().pixel(1, 0),
+            2,
+            "sprite color 0 transparent -> BG color 2"
+        );
     }
 
     #[test]
@@ -1262,7 +1323,11 @@ mod tests {
         // visible). With flip line 0 reads row 7 (which we just cleared).
         place_sprite(&mut ppu, 0, 16, 8, 1, OAM_ATTR_Y_FLIP);
         ppu.tick(TO_HBLANK);
-        assert_eq!(ppu.framebuffer().pixel(0, 0), 0, "y-flip reads row 7 of tile (cleared)");
+        assert_eq!(
+            ppu.framebuffer().pixel(0, 0),
+            0,
+            "y-flip reads row 7 of tile (cleared)"
+        );
     }
 
     #[test]
@@ -1285,7 +1350,11 @@ mod tests {
         }
         place_sprite(&mut ppu, 0, 16, 8, 1, OAM_ATTR_PRIORITY);
         ppu.tick(TO_HBLANK);
-        assert_eq!(ppu.framebuffer().pixel(0, 0), 1, "BG color 1 covers the sprite");
+        assert_eq!(
+            ppu.framebuffer().pixel(0, 0),
+            1,
+            "BG color 1 covers the sprite"
+        );
     }
 
     #[test]
@@ -1294,7 +1363,11 @@ mod tests {
         // BG tile 0 stays all zero (color 0 everywhere).
         place_sprite(&mut ppu, 0, 16, 8, 1, OAM_ATTR_PRIORITY);
         ppu.tick(TO_HBLANK);
-        assert_eq!(ppu.framebuffer().pixel(0, 0), 3, "sprite still draws over BG color 0");
+        assert_eq!(
+            ppu.framebuffer().pixel(0, 0),
+            3,
+            "sprite still draws over BG color 0"
+        );
     }
 
     #[test]
@@ -1370,9 +1443,17 @@ mod tests {
 
         // Tick to HBlank entry of line 8 (= top of the bottom tile).
         ppu.tick(TO_HBLANK + 456 * 8);
-        assert_eq!(ppu.framebuffer().pixel(0, 8), 1, "line 8 reads bottom tile (color 1)");
+        assert_eq!(
+            ppu.framebuffer().pixel(0, 8),
+            1,
+            "line 8 reads bottom tile (color 1)"
+        );
         // Line 7 (last row of top tile): still color 3.
-        assert_eq!(ppu.framebuffer().pixel(0, 7), 3, "line 7 still top tile (color 3)");
+        assert_eq!(
+            ppu.framebuffer().pixel(0, 7),
+            3,
+            "line 7 still top tile (color 3)"
+        );
     }
 
     #[test]
@@ -1398,6 +1479,10 @@ mod tests {
         // Switch to map $9C00 during HBlank.
         ppu.write(0xff40, 0x91 | LCDC_BG_TILE_MAP);
         ppu.tick(456 - TO_HBLANK + TO_HBLANK);
-        assert_eq!(ppu.framebuffer().pixel(0, 1), 1, "line 1 reads from the $9C00 map");
+        assert_eq!(
+            ppu.framebuffer().pixel(0, 1),
+            1,
+            "line 1 reads from the $9C00 map"
+        );
     }
 }

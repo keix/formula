@@ -219,7 +219,11 @@ impl Cpu {
         self.f.set_n(false);
         self.f.set_h((v & 0xf) == 0xf);
         // C unchanged
-        if idx == 6 { 12 } else { 4 }
+        if idx == 6 {
+            12
+        } else {
+            4
+        }
     }
 
     fn dec_r(&mut self, idx: u8, bus: &mut impl Bus) -> u8 {
@@ -230,7 +234,11 @@ impl Cpu {
         self.f.set_n(true);
         self.f.set_h((v & 0xf) == 0);
         // C unchanged
-        if idx == 6 { 12 } else { 4 }
+        if idx == 6 {
+            12
+        } else {
+            4
+        }
     }
 
     fn add_hl(&mut self, value: u16) {
@@ -440,24 +448,40 @@ impl Cpu {
                     _ => unreachable!(),
                 };
                 self.write_r(src, result, bus);
-                if src == 6 { 16 } else { 8 }
+                if src == 6 {
+                    16
+                } else {
+                    8
+                }
             }
             0x40..=0x7f => {
                 let bit = (opcode >> 3) & 7;
                 self.f.set_z(value & (1 << bit) == 0);
                 self.f.set_n(false);
                 self.f.set_h(true);
-                if src == 6 { 12 } else { 8 }
+                if src == 6 {
+                    12
+                } else {
+                    8
+                }
             }
             0x80..=0xbf => {
                 let bit = (opcode >> 3) & 7;
                 self.write_r(src, value & !(1 << bit), bus);
-                if src == 6 { 16 } else { 8 }
+                if src == 6 {
+                    16
+                } else {
+                    8
+                }
             }
             0xc0..=0xff => {
                 let bit = (opcode >> 3) & 7;
                 self.write_r(src, value | (1 << bit), bus);
-                if src == 6 { 16 } else { 8 }
+                if src == 6 {
+                    16
+                } else {
+                    8
+                }
             }
         }
     }
@@ -739,7 +763,11 @@ impl Cpu {
                 let src = opcode & 7;
                 let value = self.read_r(src, bus);
                 self.write_r(dst, value, bus);
-                if dst == 6 || src == 6 { 8 } else { 4 }
+                if dst == 6 || src == 6 {
+                    8
+                } else {
+                    4
+                }
             }
             0x80..=0xbf => {
                 let op = (opcode >> 3) & 7;
@@ -756,7 +784,11 @@ impl Cpu {
                     7 => self.cp_a(value),
                     _ => unreachable!(),
                 }
-                if src == 6 { 8 } else { 4 }
+                if src == 6 {
+                    8
+                } else {
+                    4
+                }
             }
             0xc0 => self.ret_cc(0, bus), // RET NZ
             0xc1 => {
@@ -801,7 +833,7 @@ impl Cpu {
                 self.set_de(v);
                 12
             }
-            0xd2 => self.jp_cc(2, bus), // JP NC, nn
+            0xd2 => self.jp_cc(2, bus),   // JP NC, nn
             0xd4 => self.call_cc(2, bus), // CALL NC
             0xd5 => {
                 self.push16(bus, self.de());
@@ -820,7 +852,7 @@ impl Cpu {
                 self.ime_delay = 0;
                 16
             }
-            0xda => self.jp_cc(3, bus), // JP C, nn
+            0xda => self.jp_cc(3, bus),   // JP C, nn
             0xdc => self.call_cc(3, bus), // CALL C
             0xde => {
                 let n = self.fetch8(bus);
@@ -1048,7 +1080,7 @@ mod tests {
                 0x26, 0x40, // LD H, 0x40
                 0x2e, 0x50, // LD L, 0x50
                 0x3e, 0xa0, // LD A, 0xA0
-                0x76,       // HALT
+                0x76, // HALT
             ],
         );
 
@@ -1701,7 +1733,10 @@ mod tests {
         assert!(!cpu.ime, "IME should not be set immediately after EI");
 
         cpu.step(&mut mem); // NOP, IME still 0 during this instruction
-        assert!(cpu.ime, "IME should be set after the instruction following EI");
+        assert!(
+            cpu.ime,
+            "IME should be set after the instruction following EI"
+        );
     }
 
     #[test]
@@ -1740,7 +1775,9 @@ mod tests {
 
     #[test]
     fn illegal_opcodes_lock_cpu() {
-        for opcode in [0xd3_u8, 0xdb, 0xdd, 0xe3, 0xe4, 0xeb, 0xec, 0xed, 0xf4, 0xfc, 0xfd] {
+        for opcode in [
+            0xd3_u8, 0xdb, 0xdd, 0xe3, 0xe4, 0xeb, 0xec, 0xed, 0xf4, 0xfc, 0xfd,
+        ] {
             let mut cpu = Cpu::new();
             let mut mem = Memory::new();
             mem.load(0x0000, &[opcode]);
@@ -2645,8 +2682,8 @@ mod tests {
         cpu.step(&mut mem);
 
         assert_eq!(cpu.a, 0x00); // 0x80 << 1 with carry-in 0
-        assert!(!cpu.f.z());     // Z must be 0 even when result is 0
-        assert!(cpu.f.c());      // old bit 7
+        assert!(!cpu.f.z()); // Z must be 0 even when result is 0
+        assert!(cpu.f.c()); // old bit 7
     }
 
     #[test]

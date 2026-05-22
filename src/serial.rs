@@ -2,9 +2,14 @@ pub struct Serial {
     sb: u8,
     sc: u8,
     output: Vec<u8>,
+    transfer_cycles_remaining: u16,
     // Latched when a transfer is started; consumed by tick() to set IF bit 3.
     pending_interrupt: bool,
 }
+
+const SC_START: u8 = 0x80;
+const SC_INTERNAL_CLOCK: u8 = 0x01;
+const SERIAL_TRANSFER_CYCLES: u16 = 8 * 512;
 
 impl Serial {
     pub fn new() -> Self {
@@ -12,6 +17,7 @@ impl Serial {
             sb: 0,
             sc: 0,
             output: Vec::new(),
+            transfer_cycles_remaining: 0,
             pending_interrupt: false,
         }
     }
@@ -31,15 +37,14 @@ impl Serial {
             0xff02 => {
                 // Only bits 7 (transfer start) and 0 (clock select) are
                 // writable on DMG; the rest are wired high on read.
-                self.sc = value & 0x81;
-                if value & 0x80 != 0 {
-                    // Treat the transfer as instantaneous: capture the byte,
-                    // clear the start flag, and queue the completion IRQ.
-                    // This is sufficient for Blargg-style serial logging,
-                    // which polls SC bit 7 to wait for the byte to drain.
-                    self.output.push(self.sb);
-                    self.sc &= 0x7f;
-                    self.pending_interrupt = true;
+                self.sc = value & (SC_START | SC_INTERNAL_CLOCK);
+                self.transfer_cycles_remaining = 0;
+
+                // With no emulated link partner, only the internal-clock
+                // mode can make progress. External-clock transfers keep the
+                // start bit set and never complete on their own.
+                if self.sc == (SC_START | SC_INTERNAL_CLOCK) {
+                    self.transfer_cycles_remaining = SERIAL_TRANSFER_CYCLES;
                 }
             }
             _ => panic!("Serial: unmapped write at {:#06x}", addr),
@@ -48,7 +53,19 @@ impl Serial {
 
     /// Tick the serial port. Returns true if the Serial interrupt should be
     /// raised during this tick.
-    pub fn tick(&mut self, _cycles: u8) -> bool {
+    pub fn tick(&mut self, cycles: u8) -> bool {
+        if self.transfer_cycles_remaining != 0 {
+            self.transfer_cycles_remaining = self
+                .transfer_cycles_remaining
+                .saturating_sub(u16::from(cycles));
+            if self.transfer_cycles_remaining == 0 {
+                self.output.push(self.sb);
+                self.sb = 0xff;
+                self.sc &= !SC_START;
+                self.pending_interrupt = true;
+            }
+        }
+
         let raise = self.pending_interrupt;
         self.pending_interrupt = false;
         raise
@@ -69,12 +86,27 @@ impl Default for Serial {
 mod tests {
     use super::*;
 
+    fn run_transfer(serial: &mut Serial) -> bool {
+        let mut remaining = SERIAL_TRANSFER_CYCLES;
+        let mut irq = false;
+        while remaining > 0 {
+            let chunk = remaining.min(u16::from(u8::MAX)) as u8;
+            irq |= serial.tick(chunk);
+            remaining -= u16::from(chunk);
+        }
+        irq
+    }
+
     #[test]
     fn writing_sc_with_start_bit_captures_sb() {
         let mut serial = Serial::new();
         serial.write(0xff01, 0x41); // 'A'
         serial.write(0xff02, 0x81);
 
+        assert!(serial.drain_output().is_empty());
+        assert_eq!(serial.read(0xff02) & 0x80, 0x80);
+
+        assert!(run_transfer(&mut serial));
         assert_eq!(serial.drain_output(), b"A");
     }
 
@@ -91,8 +123,9 @@ mod tests {
     fn transfer_clears_start_flag_on_read() {
         let mut serial = Serial::new();
         serial.write(0xff02, 0x81);
+        run_transfer(&mut serial);
 
-        // bit 7 must read as 0 after the (instantaneous) transfer completes
+        // bit 7 must read as 0 after the transfer completes
         assert_eq!(serial.read(0xff02) & 0x80, 0);
     }
 
@@ -107,7 +140,7 @@ mod tests {
         let mut serial = Serial::new();
         serial.write(0xff02, 0x81);
 
-        assert!(serial.tick(4));
+        assert!(run_transfer(&mut serial));
         assert!(!serial.tick(4), "interrupt must not refire");
     }
 
@@ -122,10 +155,25 @@ mod tests {
         let mut serial = Serial::new();
         serial.write(0xff01, 0x41);
         serial.write(0xff02, 0x81);
+        run_transfer(&mut serial);
         serial.write(0xff01, 0x42);
         serial.write(0xff02, 0x81);
+        run_transfer(&mut serial);
 
         assert_eq!(serial.drain_output(), b"AB");
         assert!(serial.drain_output().is_empty());
+    }
+
+    #[test]
+    fn external_clock_transfer_never_completes_without_partner() {
+        let mut serial = Serial::new();
+        serial.write(0xff01, 0x41);
+        serial.write(0xff02, 0x80);
+
+        for _ in 0..100 {
+            assert!(!serial.tick(255));
+        }
+        assert!(serial.drain_output().is_empty());
+        assert_eq!(serial.read(0xff02) & 0x80, 0x80);
     }
 }

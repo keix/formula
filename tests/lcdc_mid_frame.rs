@@ -59,29 +59,29 @@ fn build_rom(lyc: u8, new_lcdc: u8) -> Vec<u8> {
         0x31, 0xff, 0xcf, // LD SP, $CFFF
         // --- Fill tile 0 ($8000-$800F) with 16 bytes of 0xFF ---
         0x21, 0x00, 0x80, // LD HL, $8000
-        0x3e, 0xff,       // LD A, $FF
-        0x06, 0x10,       // LD B, 16
-        0x22,             // .loop: LD [HL+], A
-        0x05,             //        DEC B
-        0x20, 0xfc,       //        JR NZ, .loop  (back -4)
+        0x3e, 0xff, // LD A, $FF
+        0x06, 0x10, // LD B, 16
+        0x22, // .loop: LD [HL+], A
+        0x05, //        DEC B
+        0x20, 0xfc, //        JR NZ, .loop  (back -4)
         // --- STAT setup: bit 6 enables LYC=LY interrupts ---
-        0x3e, 0x40,       // LD A, $40
-        0xe0, 0x41,       // LDH ($41), A   ; STAT
+        0x3e, 0x40, // LD A, $40
+        0xe0, 0x41, // LDH ($41), A   ; STAT
         // --- LYC ---
-        0x3e, lyc,        // LD A, lyc
-        0xe0, 0x45,       // LDH ($45), A
+        0x3e, lyc, // LD A, lyc
+        0xe0, 0x45, // LDH ($45), A
         // --- IE: STAT only ---
-        0x3e, 0x02,       // LD A, $02
-        0xe0, 0xff,       // LDH ($FF), A   ; IE
+        0x3e, 0x02, // LD A, $02
+        0xe0, 0xff, // LDH ($FF), A   ; IE
         // --- LCDC: LCD on, tile data unsigned ($8000), BG on ---
-        0x3e, 0x91,       // LD A, $91
-        0xe0, 0x40,       // LDH ($40), A
+        0x3e, 0x91, // LD A, $91
+        0xe0, 0x40, // LDH ($40), A
         // --- BGP: identity ---
-        0x3e, 0xe4,       // LD A, $E4
-        0xe0, 0x47,       // LDH ($47), A
-        0xfb,             // EI
-        0x76,             // .forever: HALT
-        0x18, 0xfd,       //           JR .forever (back -3)
+        0x3e, 0xe4, // LD A, $E4
+        0xe0, 0x47, // LDH ($47), A
+        0xfb, // EI
+        0x76, // .forever: HALT
+        0x18, 0xfd, //           JR .forever (back -3)
     ];
     rom[0x0150..0x0150 + program.len()].copy_from_slice(program);
     rom
@@ -111,7 +111,11 @@ fn stat_lyc_isr_disables_bg_starting_at_target_line() {
     assert_eq!(fb.pixel(0, 79), 3, "line 79 (just before LYC)");
 
     // At and after LYC: ISR has cleared LCDC.0 -> shade 0.
-    assert_eq!(fb.pixel(0, 80), 0, "line 80 (LYC line itself sees the change)");
+    assert_eq!(
+        fb.pixel(0, 80),
+        0,
+        "line 80 (LYC line itself sees the change)"
+    );
     assert_eq!(fb.pixel(0, 100), 0, "line 100 stays off");
     assert_eq!(fb.pixel(0, 143), 0, "last visible line stays off");
 }

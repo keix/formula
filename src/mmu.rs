@@ -437,7 +437,7 @@ mod tests {
     fn stat_interrupt_propagates_to_if_bit_1() {
         let mut mmu = make_mmu();
         mmu.write8(0xff40, 0x80); // enable LCD
-        // Enable LYC source with LYC = LY = 0; first PPU tick raises the line.
+                                  // Enable LYC source with LYC = LY = 0; first PPU tick raises the line.
         mmu.write8(0xff45, 0);
         mmu.write8(0xff41, 0b0100_0000);
 
@@ -519,12 +519,19 @@ mod tests {
         mmu.write8(0xff01, 0x41); // SB = 'A'
         mmu.write8(0xff02, 0x81); // SC = transfer start
 
-        // Bit 7 of SC reads as 0 immediately (instant-transfer stub).
-        assert_eq!(mmu.read8(0xff02) & 0x80, 0);
+        // Start bit stays high until the internal-clock transfer finishes.
+        assert_eq!(mmu.read8(0xff02) & 0x80, 0x80);
 
-        // Next tick propagates the queued interrupt into IF.
-        mmu.tick(4);
+        // Internal-clock DMG serial takes 8 bits * 512 T-cycles.
+        let mut remaining = 8_u32 * 512;
+        while remaining > 0 {
+            let chunk = remaining.min(255) as u8;
+            mmu.tick(chunk);
+            remaining -= u32::from(chunk);
+        }
+
         assert_eq!(mmu.read8(0xff0f) & 0x08, 0x08);
+        assert_eq!(mmu.read8(0xff02) & 0x80, 0);
 
         assert_eq!(mmu.drain_serial_output(), b"A");
     }
@@ -544,7 +551,10 @@ mod tests {
             remaining -= u32::from(chunk);
         }
 
-        assert!(mmu.take_frame_ready(), "frame should be ready at VBlank entry");
+        assert!(
+            mmu.take_frame_ready(),
+            "frame should be ready at VBlank entry"
+        );
         assert!(!mmu.take_frame_ready(), "the flag is one-shot");
     }
 
