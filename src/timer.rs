@@ -118,12 +118,7 @@ mod tests {
     #[test]
     fn tima_increments_at_each_clock_rate() {
         // (TAC bits 1-0, expected cycles per TIMA increment)
-        let rates = [
-            (0b00, 1024_u32),
-            (0b01, 16),
-            (0b10, 64),
-            (0b11, 256),
-        ];
+        let rates = [(0b00, 1024_u32), (0b01, 16), (0b10, 64), (0b11, 256)];
         for (clock_sel, cycles_per_inc) in rates {
             let mut timer = Timer::new();
             timer.write(0xff07, 0x04 | clock_sel as u8);
