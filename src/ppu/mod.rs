@@ -70,6 +70,10 @@ pub struct Ppu {
     // window is actually drawn; resets at the start of every frame and when
     // the LCD turns off.
     wly: u8,
+    // After LCD enable on DMG, the first visible scanline is slightly shorter
+    // than a steady-state line. Blargg's oam_bug lcd_sync test expects LY to
+    // advance after 110 M-cycles rather than the usual 114.
+    first_line_after_enable: bool,
     // Per-pixel BG/Window color index (0..3) for the current scanline.
     // Sprites read this to honour the BG-over-OBJ priority attribute.
     bg_color_index: [u8; WIDTH],
@@ -86,6 +90,7 @@ impl Ppu {
             dots: 0,
             stat_line: false,
             wly: 0,
+            first_line_after_enable: false,
             bg_color_index: [0; WIDTH],
         }
     }
@@ -130,20 +135,17 @@ impl Ppu {
         self.mode
     }
 
-    /// If a CPU M-cycle of `cycles` dots starts right now during mode 2,
-    /// return the OAM row (0..19) the PPU is scanning in that M-cycle.
-    pub fn oam_bug_row_for_chunk(&self, cycles: u8) -> Option<usize> {
-        if (self.regs.lcdc & LCDC_LCD_ENABLE) == 0 || self.regs.ly >= 144 || self.dots >= 80 {
+    /// If the CPU is about to perform a timed access at the end of an M-cycle
+    /// during the DMG OAM corruption window, return the OAM row (0..19) being
+    /// scanned at that access point.
+    pub fn oam_bug_row_for_access(&self) -> Option<usize> {
+        if (self.regs.lcdc & LCDC_LCD_ENABLE) == 0 || self.regs.ly >= 144 {
             return None;
         }
-
-        let start_row = usize::from(self.dots / 4);
-        let end_dot = self.dots + u16::from(cycles).saturating_sub(1);
-        if end_dot >= 80 || usize::from(end_dot / 4) != start_row {
+        if self.dots >= 80 {
             return None;
         }
-
-        Some(start_row)
+        Some(usize::from(self.dots / 4))
     }
 
     /// The fully composited framebuffer for the most recent frame.
@@ -219,6 +221,14 @@ impl Ppu {
             self.mode = PpuMode::HBlank;
             self.stat_line = false;
             self.wly = 0;
+            self.first_line_after_enable = false;
+        } else if !was_on && now_on {
+            self.regs.ly = 0;
+            self.dots = 0;
+            self.mode = PpuMode::HBlank;
+            self.stat_line = false;
+            self.wly = 0;
+            self.first_line_after_enable = true;
         }
     }
 
@@ -243,9 +253,15 @@ impl Ppu {
         let mut interrupts = 0;
         for _ in 0..cycles {
             self.dots += 1;
-            if self.dots == 456 {
+            let line_cycles = if self.first_line_after_enable && self.regs.ly == 0 {
+                452
+            } else {
+                456
+            };
+            if self.dots == line_cycles {
                 self.dots = 0;
                 self.regs.ly += 1;
+                self.first_line_after_enable = false;
                 if self.regs.ly == 154 {
                     self.regs.ly = 0;
                     // Window line counter restarts at the top of every frame.
@@ -525,8 +541,11 @@ mod tests {
     fn ppu_mode_transitions_within_a_line() {
         let mut ppu = ppu_on();
 
+        assert_eq!(ppu.mode(), PpuMode::HBlank);
+        ppu.tick(1);
         assert_eq!(ppu.mode(), PpuMode::OamSearch);
-        ppu.tick(79);
+
+        ppu.tick(78);
         assert_eq!(ppu.mode(), PpuMode::OamSearch);
 
         ppu.tick(1);
@@ -542,7 +561,7 @@ mod tests {
     #[test]
     fn ppu_enters_vblank_at_ly_144() {
         let mut ppu = ppu_on();
-        ppu.tick(456 * 144);
+        ppu.tick(456 * 144 - 4);
 
         assert_eq!(ppu.regs.ly, 144);
         assert_eq!(ppu.mode(), PpuMode::VBlank);
@@ -551,7 +570,7 @@ mod tests {
     #[test]
     fn ppu_stays_in_vblank_throughout_lines_144_to_153() {
         let mut ppu = ppu_on();
-        ppu.tick(456 * 144);
+        ppu.tick(456 * 144 - 4);
         assert_eq!(ppu.mode(), PpuMode::VBlank);
 
         for _ in 0..(456 * 10 - 1) {
@@ -563,7 +582,7 @@ mod tests {
     #[test]
     fn ppu_wraps_ly_after_a_full_frame() {
         let mut ppu = ppu_on();
-        ppu.tick(456 * 154);
+        ppu.tick(456 * 154 - 4);
 
         assert_eq!(ppu.regs.ly, 0);
         assert_eq!(ppu.mode(), PpuMode::OamSearch);
@@ -573,7 +592,7 @@ mod tests {
     fn tick_returns_vblank_bit_once_per_frame() {
         let mut ppu = ppu_on();
 
-        assert_eq!(ppu.tick(456 * 144 - 1), 0);
+        assert_eq!(ppu.tick(456 * 144 - 5), 0);
         assert_eq!(ppu.tick(1), 0x01);
         assert_eq!(ppu.tick(456 * 10 - 1), 0);
         assert_eq!(ppu.tick(1), 0);
@@ -582,9 +601,12 @@ mod tests {
     #[test]
     fn stat_read_carries_mode_bits() {
         let mut ppu = ppu_on();
+        assert_eq!(ppu.read(0xff41) & 0b11, 0b00);
+
+        ppu.tick(1);
         assert_eq!(ppu.read(0xff41) & 0b11, 0b10);
 
-        ppu.tick(80);
+        ppu.tick(79);
         assert_eq!(ppu.read(0xff41) & 0b11, 0b11);
 
         ppu.tick(172);

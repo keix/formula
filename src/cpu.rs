@@ -106,27 +106,27 @@ impl Cpu {
 
     fn read8_timed(&mut self, bus: &mut impl Bus, addr: u16) -> u8 {
         self.mcycle(bus);
-        bus.cpu_read8(addr)
+        bus.read8_cpu(addr)
     }
 
     fn write8_timed(&mut self, bus: &mut impl Bus, addr: u16, value: u8) {
         self.mcycle(bus);
-        bus.cpu_write8(addr, value);
+        bus.write8_cpu(addr, value);
     }
 
-    fn read8_timed_idu(&mut self, bus: &mut impl Bus, addr: u16) -> u8 {
+    fn read8_timed_idu(&mut self, bus: &mut impl Bus, addr: u16, idu_addr: u16) -> u8 {
         self.mcycle(bus);
-        bus.cpu_read8_idu(addr)
+        bus.read8_cpu_idu(addr, idu_addr)
     }
 
-    fn write8_timed_idu(&mut self, bus: &mut impl Bus, addr: u16, value: u8) {
+    fn write8_timed_idu(&mut self, bus: &mut impl Bus, addr: u16, value: u8, idu_addr: u16) {
         self.mcycle(bus);
-        bus.cpu_write8_idu(addr, value);
+        bus.write8_cpu_idu(addr, value, idu_addr);
     }
 
     fn idu_timed(&mut self, bus: &mut impl Bus, addr: u16) {
         self.mcycle(bus);
-        bus.cpu_idu_glitch(addr);
+        bus.idu_glitch_cpu(addr);
     }
 
     fn fetch8(&mut self, bus: &mut impl Bus) -> u8 {
@@ -153,16 +153,18 @@ impl Cpu {
 
     fn push16(&mut self, bus: &mut impl Bus, value: u16) {
         let [hi, lo] = value.to_be_bytes();
+        let idu_addr = self.sp;
         self.sp = self.sp.wrapping_sub(1);
-        self.write8_timed(bus, self.sp, hi);
+        self.write8_timed_idu(bus, self.sp, hi, idu_addr);
+        let idu_addr = self.sp;
         self.sp = self.sp.wrapping_sub(1);
-        self.write8_timed(bus, self.sp, lo);
+        self.write8_timed_idu(bus, self.sp, lo, idu_addr);
     }
 
     fn pop16(&mut self, bus: &mut impl Bus) -> u16 {
-        let lo = self.read8_timed(bus, self.sp);
+        let lo = self.read8_timed_idu(bus, self.sp, self.sp);
         self.sp = self.sp.wrapping_add(1);
-        let hi = self.read8_timed(bus, self.sp);
+        let hi = self.read8_timed_idu(bus, self.sp, self.sp);
         self.sp = self.sp.wrapping_add(1);
         u16::from_be_bytes([hi, lo])
     }
@@ -738,7 +740,7 @@ impl Cpu {
             }
             0x22 => {
                 let hl = self.hl();
-                self.write8_timed_idu(bus, hl, self.a);
+                self.write8_timed_idu(bus, hl, self.a, hl);
                 self.set_hl(self.hl().wrapping_add(1));
                 8
             }
@@ -765,7 +767,7 @@ impl Cpu {
             }
             0x2a => {
                 let hl = self.hl();
-                self.a = self.read8_timed_idu(bus, hl);
+                self.a = self.read8_timed_idu(bus, hl, hl);
                 self.set_hl(self.hl().wrapping_add(1));
                 8
             }
@@ -793,7 +795,7 @@ impl Cpu {
             }
             0x32 => {
                 let hl = self.hl();
-                self.write8_timed_idu(bus, hl, self.a);
+                self.write8_timed_idu(bus, hl, self.a, hl);
                 self.set_hl(self.hl().wrapping_sub(1));
                 8
             }
@@ -823,7 +825,7 @@ impl Cpu {
             }
             0x3a => {
                 let hl = self.hl();
-                self.a = self.read8_timed_idu(bus, hl);
+                self.a = self.read8_timed_idu(bus, hl, hl);
                 self.set_hl(self.hl().wrapping_sub(1));
                 8
             }

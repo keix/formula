@@ -43,10 +43,18 @@ pub struct Mmu {
     // Set when the PPU just entered VBlank (i.e. completed a frame).
     // The display loop consumes this via take_frame_ready().
     frame_ready: bool,
-    // The OAM row (0..19) the PPU scanned during the most recent CPU-size
-    // M-cycle. The DMG OAM corruption bug uses the currently scanned row
-    // during mode 2 and ignores the actual CPU access address/value.
+    // If the most recent CPU M-cycle overlapped a single mode-2 OAM scan row,
+    // cache that row so the following CPU access can apply the DMG OAM bug.
     last_oam_bug_row: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+enum OamBugKind {
+    Read,
+    Write,
+    ReadIdu,
+    WriteIdu,
+    Idu,
 }
 
 impl Mmu {
@@ -67,16 +75,44 @@ impl Mmu {
         }
     }
 
+    /// Push the current set of pressed buttons (a bitmask of joypad::BUTTON_*)
+    /// into the joypad. Raises IF bit 4 if any button just became pressed.
+    pub fn set_buttons(&mut self, pressed: u8) {
+        self.joypad.set_pressed(pressed);
+        if self.joypad.take_interrupt() {
+            self.io[0x0f] |= 0x10; // Joypad -> IF bit 4
+        }
+    }
+
+    fn start_oam_dma(&mut self, value: u8) {
+        self.dma = value;
+        let base = (value as u16) << 8;
+        // Real hardware bus-blocks the CPU for ~160 M-cycles and only HRAM
+        // stays accessible. We do an instant 160-byte copy; ROMs that rely
+        // on a HRAM bounce-routine still work because read8 below covers
+        // every address space the source value can legally point at.
+        for i in 0..0xa0_u16 {
+            let byte = self.read8(base + i);
+            self.ppu.write_oam(0xfe00 + i, byte);
+        }
+    }
+
     fn oam_word(&self, row: usize, word: usize) -> u16 {
-        let base = 0xfe00 + (row as u16) * 8 + (word as u16) * 2;
-        u16::from_le_bytes([self.ppu.read_oam(base), self.ppu.read_oam(base + 1)])
+        debug_assert!(row < 20);
+        debug_assert!(word < 4);
+        let addr = 0xfe00 + (row as u16 * 8) + (word as u16 * 2);
+        let lo = self.ppu.read_oam(addr);
+        let hi = self.ppu.read_oam(addr + 1);
+        u16::from_le_bytes([lo, hi])
     }
 
     fn set_oam_word(&mut self, row: usize, word: usize, value: u16) {
-        let base = 0xfe00 + (row as u16) * 8 + (word as u16) * 2;
+        debug_assert!(row < 20);
+        debug_assert!(word < 4);
+        let addr = 0xfe00 + (row as u16 * 8) + (word as u16 * 2);
         let [lo, hi] = value.to_le_bytes();
-        self.ppu.write_oam(base, lo);
-        self.ppu.write_oam(base + 1, hi);
+        self.ppu.write_oam(addr, lo);
+        self.ppu.write_oam(addr + 1, hi);
     }
 
     fn apply_oam_write_corruption(&mut self, row: usize) {
@@ -108,17 +144,16 @@ impl Mmu {
     }
 
     fn apply_oam_read_idu_corruption(&mut self, row: usize) {
-        if (4..19).contains(&row) {
+        if row >= 2 {
             let a = self.oam_word(row - 2, 0);
             let b = self.oam_word(row - 1, 0);
             let c = self.oam_word(row, 0);
             let d = self.oam_word(row - 1, 2);
             self.set_oam_word(row - 1, 0, (b & (a | c | d)) | (a & c & d));
-
-            for word in 0..4 {
-                let value = self.oam_word(row - 1, word);
-                self.set_oam_word(row, word, value);
-                self.set_oam_word(row - 2, word, value);
+            for word in 1..4 {
+                let prev = self.oam_word(row - 1, word);
+                self.set_oam_word(row, word, prev);
+                self.set_oam_word(row - 2, word, prev);
             }
         }
 
@@ -135,43 +170,21 @@ impl Mmu {
 
         match kind {
             OamBugKind::Read => self.apply_oam_read_corruption(row),
-            OamBugKind::Write | OamBugKind::IduWrite | OamBugKind::WriteIdu => {
-                self.apply_oam_write_corruption(row)
+            OamBugKind::Write | OamBugKind::WriteIdu | OamBugKind::Idu => {
+                self.apply_oam_write_corruption(row);
             }
             OamBugKind::ReadIdu => self.apply_oam_read_idu_corruption(row),
-        }
-    }
-
-    /// Push the current set of pressed buttons (a bitmask of joypad::BUTTON_*)
-    /// into the joypad. Raises IF bit 4 if any button just became pressed.
-    pub fn set_buttons(&mut self, pressed: u8) {
-        self.joypad.set_pressed(pressed);
-        if self.joypad.take_interrupt() {
-            self.io[0x0f] |= 0x10; // Joypad -> IF bit 4
-        }
-    }
-
-    fn start_oam_dma(&mut self, value: u8) {
-        self.dma = value;
-        let base = (value as u16) << 8;
-        // Real hardware bus-blocks the CPU for ~160 M-cycles and only HRAM
-        // stays accessible. We do an instant 160-byte copy; ROMs that rely
-        // on a HRAM bounce-routine still work because read8 below covers
-        // every address space the source value can legally point at.
-        for i in 0..0xa0_u16 {
-            let byte = self.read8(base + i);
-            self.ppu.write_oam(0xfe00 + i, byte);
         }
     }
 
     /// Advance memory-mapped sub-systems by `cycles` T-cycles. Subsystems
     /// that raise interrupts set the corresponding bit in IF (0xFF0F).
     pub fn tick(&mut self, cycles: u8) {
-        self.last_oam_bug_row = self.ppu.oam_bug_row_for_chunk(cycles);
         if self.timer.tick(cycles) {
             self.io[0x0f] |= 0x04; // Timer interrupt -> IF bit 2
         }
         let ppu_if = self.ppu.tick(u32::from(cycles));
+        self.last_oam_bug_row = self.ppu.oam_bug_row_for_access();
         if ppu_if != 0 {
             self.io[0x0f] |= ppu_if;
             if ppu_if & 0x01 != 0 {
@@ -200,15 +213,10 @@ impl Mmu {
     pub fn framebuffer(&self) -> &Framebuffer {
         self.ppu.framebuffer()
     }
-}
 
-#[derive(Clone, Copy)]
-enum OamBugKind {
-    Read,
-    Write,
-    IduWrite,
-    ReadIdu,
-    WriteIdu,
+    fn write8_cpu_impl(&mut self, addr: u16, value: u8) {
+        self.write8(addr, value);
+    }
 }
 
 impl Bus for Mmu {
@@ -262,28 +270,30 @@ impl Bus for Mmu {
         Mmu::tick(self, cycles);
     }
 
-    fn cpu_read8(&mut self, addr: u16) -> u8 {
+    fn read8_cpu(&mut self, addr: u16) -> u8 {
+        let value = self.read8(addr);
         self.maybe_apply_oam_bug(addr, OamBugKind::Read);
-        self.read8(addr)
+        value
     }
 
-    fn cpu_write8(&mut self, addr: u16, value: u8) {
+    fn write8_cpu(&mut self, addr: u16, value: u8) {
+        self.write8_cpu_impl(addr, value);
         self.maybe_apply_oam_bug(addr, OamBugKind::Write);
-        self.write8(addr, value);
     }
 
-    fn cpu_read8_idu(&mut self, addr: u16) -> u8 {
-        self.maybe_apply_oam_bug(addr, OamBugKind::ReadIdu);
-        self.read8(addr)
+    fn read8_cpu_idu(&mut self, addr: u16, idu_addr: u16) -> u8 {
+        let value = self.read8(addr);
+        self.maybe_apply_oam_bug(idu_addr, OamBugKind::ReadIdu);
+        value
     }
 
-    fn cpu_write8_idu(&mut self, addr: u16, value: u8) {
-        self.maybe_apply_oam_bug(addr, OamBugKind::WriteIdu);
-        self.write8(addr, value);
+    fn write8_cpu_idu(&mut self, addr: u16, value: u8, idu_addr: u16) {
+        self.write8_cpu_impl(addr, value);
+        self.maybe_apply_oam_bug(idu_addr, OamBugKind::WriteIdu);
     }
 
-    fn cpu_idu_glitch(&mut self, addr: u16) {
-        self.maybe_apply_oam_bug(addr, OamBugKind::IduWrite);
+    fn idu_glitch_cpu(&mut self, addr: u16) {
+        self.maybe_apply_oam_bug(addr, OamBugKind::Idu);
     }
 }
 
