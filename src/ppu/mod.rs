@@ -1,48 +1,25 @@
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum PpuMode {
-    HBlank,
-    VBlank,
-    OamSearch,
-    Drawing,
-}
+mod framebuffer;
+mod mode;
+mod registers;
+
+pub use framebuffer::{Framebuffer, HEIGHT, WIDTH};
+pub use mode::PpuMode;
+pub use registers::Registers;
 
 pub struct Ppu {
-    pub lcdc: u8,
-    stat_select: u8, // only bits 6..=3 are writable; others computed on read
-    pub scy: u8,
-    pub scx: u8,
-    pub ly: u8,
-    pub lyc: u8,
-    pub dma: u8,
-    pub bgp: u8,
-    pub obp0: u8,
-    pub obp1: u8,
-    pub wy: u8,
-    pub wx: u8,
-
+    pub regs: Registers,
+    framebuffer: Framebuffer,
     mode: PpuMode,
     dots: u16,
-    framebuffer: [u8; 160 * 144],
 }
 
 impl Ppu {
     pub fn new() -> Self {
         Self {
-            lcdc: 0,
-            stat_select: 0,
-            scy: 0,
-            scx: 0,
-            ly: 0,
-            lyc: 0,
-            dma: 0,
-            bgp: 0,
-            obp0: 0,
-            obp1: 0,
-            wy: 0,
-            wx: 0,
+            regs: Registers::new(),
+            framebuffer: Framebuffer::new(),
             mode: PpuMode::OamSearch,
             dots: 0,
-            framebuffer: [0; 160 * 144],
         }
     }
 
@@ -50,63 +27,61 @@ impl Ppu {
         self.mode
     }
 
-    pub fn framebuffer(&self) -> &[u8; 160 * 144] {
+    pub fn framebuffer(&self) -> &Framebuffer {
         &self.framebuffer
     }
 
     pub fn read(&self, addr: u16) -> u8 {
         match addr {
-            0xff40 => self.lcdc,
+            0xff40 => self.regs.lcdc,
             0xff41 => self.read_stat(),
-            0xff42 => self.scy,
-            0xff43 => self.scx,
-            0xff44 => self.ly,
-            0xff45 => self.lyc,
-            0xff46 => self.dma,
-            0xff47 => self.bgp,
-            0xff48 => self.obp0,
-            0xff49 => self.obp1,
-            0xff4a => self.wy,
-            0xff4b => self.wx,
+            0xff42 => self.regs.scy,
+            0xff43 => self.regs.scx,
+            0xff44 => self.regs.ly,
+            0xff45 => self.regs.lyc,
+            0xff46 => self.regs.dma,
+            0xff47 => self.regs.bgp,
+            0xff48 => self.regs.obp0,
+            0xff49 => self.regs.obp1,
+            0xff4a => self.regs.wy,
+            0xff4b => self.regs.wx,
             _ => panic!("PPU: unmapped read at {:#06x}", addr),
         }
     }
 
     pub fn write(&mut self, addr: u16, value: u8) {
         match addr {
-            0xff40 => self.lcdc = value,
+            0xff40 => self.regs.lcdc = value,
             0xff41 => self.write_stat(value),
-            0xff42 => self.scy = value,
-            0xff43 => self.scx = value,
-            0xff44 => self.ly = 0, // writing to LY resets it (DMG behavior)
-            0xff45 => self.lyc = value,
+            0xff42 => self.regs.scy = value,
+            0xff43 => self.regs.scx = value,
+            0xff44 => self.regs.ly = 0, // writing to LY resets it (DMG behavior)
+            0xff45 => self.regs.lyc = value,
             // TODO: 0xFF46 should kick off an OAM DMA transfer (160 bytes at the
             // address value << 8). Stored as a byte for now; transfer comes later.
-            0xff46 => self.dma = value,
-            0xff47 => self.bgp = value,
-            0xff48 => self.obp0 = value,
-            0xff49 => self.obp1 = value,
-            0xff4a => self.wy = value,
-            0xff4b => self.wx = value,
+            0xff46 => self.regs.dma = value,
+            0xff47 => self.regs.bgp = value,
+            0xff48 => self.regs.obp0 = value,
+            0xff49 => self.regs.obp1 = value,
+            0xff4a => self.regs.wy = value,
+            0xff4b => self.regs.wx = value,
             _ => panic!("PPU: unmapped write at {:#06x}", addr),
         }
     }
 
     fn read_stat(&self) -> u8 {
-        let mode_bits = match self.mode {
-            PpuMode::HBlank => 0b00,
-            PpuMode::VBlank => 0b01,
-            PpuMode::OamSearch => 0b10,
-            PpuMode::Drawing => 0b11,
+        let coincidence = if self.regs.ly == self.regs.lyc {
+            0b100
+        } else {
+            0
         };
-        let coincidence = if self.ly == self.lyc { 0b100 } else { 0 };
         // bit 7 always reads as 1 on DMG
-        0x80 | self.stat_select | coincidence | mode_bits
+        0x80 | self.regs.stat_select | coincidence | self.mode.stat_bits()
     }
 
     fn write_stat(&mut self, value: u8) {
         // Only the interrupt-enable bits (6..=3) are writable from the CPU
-        self.stat_select = value & 0b0111_1000;
+        self.regs.stat_select = value & 0b0111_1000;
     }
 
     /// Advance the PPU by `cycles` dots and return any IF bits to set.
@@ -116,15 +91,15 @@ impl Ppu {
             self.dots += 1;
             if self.dots == 456 {
                 self.dots = 0;
-                self.ly += 1;
-                if self.ly == 154 {
-                    self.ly = 0;
+                self.regs.ly += 1;
+                if self.regs.ly == 154 {
+                    self.regs.ly = 0;
                 }
-                if self.ly == 144 {
+                if self.regs.ly == 144 {
                     interrupts |= 0x01; // VBlank -> IF bit 0
                 }
             }
-            self.mode = if self.ly >= 144 {
+            self.mode = if self.regs.ly >= 144 {
                 PpuMode::VBlank
             } else if self.dots < 80 {
                 PpuMode::OamSearch
@@ -152,7 +127,7 @@ mod tests {
     fn ppu_advances_ly_after_456_dots() {
         let mut ppu = Ppu::new();
         ppu.tick(456);
-        assert_eq!(ppu.ly, 1);
+        assert_eq!(ppu.regs.ly, 1);
     }
 
     #[test]
@@ -178,7 +153,7 @@ mod tests {
         let mut ppu = Ppu::new();
         ppu.tick(456 * 144);
 
-        assert_eq!(ppu.ly, 144);
+        assert_eq!(ppu.regs.ly, 144);
         assert_eq!(ppu.mode(), PpuMode::VBlank);
     }
 
@@ -199,7 +174,7 @@ mod tests {
         let mut ppu = Ppu::new();
         ppu.tick(456 * 154);
 
-        assert_eq!(ppu.ly, 0);
+        assert_eq!(ppu.regs.ly, 0);
         assert_eq!(ppu.mode(), PpuMode::OamSearch);
     }
 
@@ -207,41 +182,34 @@ mod tests {
     fn tick_returns_vblank_bit_once_per_frame() {
         let mut ppu = Ppu::new();
 
-        // Lines 0..143: no VBlank yet
         assert_eq!(ppu.tick(456 * 144 - 1), 0);
-
-        // The dot that enters line 144 raises VBlank
         assert_eq!(ppu.tick(1), 0x01);
-
-        // VBlank does not refire while LY stays in 144..=153
         assert_eq!(ppu.tick(456 * 10 - 1), 0);
-
-        // Wrapping back to LY=0 doesn't raise VBlank
         assert_eq!(ppu.tick(1), 0);
     }
 
     #[test]
     fn stat_read_carries_mode_bits() {
         let mut ppu = Ppu::new();
-        assert_eq!(ppu.read(0xff41) & 0b11, 0b10); // OAM Search
+        assert_eq!(ppu.read(0xff41) & 0b11, 0b10);
 
         ppu.tick(80);
-        assert_eq!(ppu.read(0xff41) & 0b11, 0b11); // Drawing
+        assert_eq!(ppu.read(0xff41) & 0b11, 0b11);
 
         ppu.tick(172);
-        assert_eq!(ppu.read(0xff41) & 0b11, 0b00); // HBlank
+        assert_eq!(ppu.read(0xff41) & 0b11, 0b00);
 
         ppu.tick(456 * 144 - 252);
-        assert_eq!(ppu.read(0xff41) & 0b11, 0b01); // VBlank
+        assert_eq!(ppu.read(0xff41) & 0b11, 0b01);
     }
 
     #[test]
     fn stat_coincidence_bit_reflects_ly_eq_lyc() {
         let mut ppu = Ppu::new();
-        ppu.write(0xff45, 0); // LYC = LY = 0
+        ppu.write(0xff45, 0);
         assert_eq!(ppu.read(0xff41) & 0b100, 0b100);
 
-        ppu.tick(456); // LY = 1, LYC still 0
+        ppu.tick(456);
         assert_eq!(ppu.read(0xff41) & 0b100, 0);
 
         ppu.write(0xff45, 1);
@@ -253,7 +221,6 @@ mod tests {
         let mut ppu = Ppu::new();
         ppu.write(0xff41, 0xff);
 
-        // Bits 6..=3 stored from write; bit 7 reads back as 1; bits 2..=0 are PPU state.
         let read = ppu.read(0xff41);
         assert_eq!(read & 0b1111_1000, 0b1111_1000);
     }
@@ -262,9 +229,9 @@ mod tests {
     fn write_to_ly_resets_to_zero() {
         let mut ppu = Ppu::new();
         ppu.tick(456 * 5);
-        assert_eq!(ppu.ly, 5);
+        assert_eq!(ppu.regs.ly, 5);
 
-        ppu.write(0xff44, 42); // value ignored
-        assert_eq!(ppu.ly, 0);
+        ppu.write(0xff44, 42);
+        assert_eq!(ppu.regs.ly, 0);
     }
 }
