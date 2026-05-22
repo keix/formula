@@ -1,3 +1,10 @@
+//! Flat 64 KiB memory backing the CPU's [`Bus`] in unit tests.
+//!
+//! The real address space is decoded by [`crate::mmu::Mmu`]; this
+//! type exists so the CPU can be exercised against a single
+//! contiguous array, with no banks, IO routing, or memory-mapped
+//! subsystems in the way.
+
 use crate::bus::Bus;
 
 pub struct Memory {
@@ -9,6 +16,9 @@ impl Memory {
         Self { data: [0; 0x10000] }
     }
 
+    /// Copy `bytes` into memory starting at `start`. Used by tests to
+    /// seed program code or fixture data; panics if the slice would
+    /// run past the end of the address space.
     pub fn load(&mut self, start: u16, bytes: &[u8]) {
         let start = start as usize;
         let end = start + bytes.len();

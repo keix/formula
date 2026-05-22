@@ -1,3 +1,24 @@
+//! Memory Management Unit — the address-bus arbiter.
+//!
+//! Implements [`Bus`] for the full 16-bit GB address space and routes
+//! each region to the subsystem that owns it: cartridge for ROM/ext
+//! RAM, PPU for VRAM/OAM and the LCD register window, Serial for
+//! 0xFF01/02, Timer for 0xFF04-07, Joypad for 0xFF00, and a private
+//! `io[]` byte array for the unmapped IO bytes the cartridge sees but
+//! we don't model (sound, mostly). `tick(cycles)` fans the cycle
+//! budget out to every subsystem and folds their IRQ requests back
+//! into IF (0xFF0F).
+//!
+//! Design notes:
+//! - OAM DMA at 0xFF46 is an MMU concern, not a PPU one, because the
+//!   transfer reads from arbitrary bus addresses. The copy is instant
+//!   here; real hardware bus-stalls the CPU for ~160 M-cycles with
+//!   only HRAM accessible. We track `frame_ready` (a one-shot VBlank
+//!   signal consumed by the runner) and the last DMA value written.
+//! - The IO region 0xFF00-0xFF7F is intentionally a catch-all: more
+//!   specific arms above it carve out the routed sub-addresses, with
+//!   clippy::match_overlapping_arm silenced where that's load-bearing.
+
 use crate::bus::Bus;
 use crate::cartridge::Cartridge;
 use crate::joypad::Joypad;
@@ -93,6 +114,8 @@ impl Mmu {
         std::mem::take(&mut self.frame_ready)
     }
 
+    /// Borrow the PPU's framebuffer so the runner can blit it without
+    /// reaching through the MMU into the PPU directly.
     pub fn framebuffer(&self) -> &Framebuffer {
         self.ppu.framebuffer()
     }

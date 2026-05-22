@@ -1,3 +1,12 @@
+//! Joypad register at 0xFF00.
+//!
+//! Tracks which of the eight buttons the host considers pressed and
+//! re-creates the active-low DMG wire format on read by ANDing the
+//! pressed-button bitmask against whichever of the two scan rows the
+//! CPU has selected (bits 5..4 of the register, written by the game).
+//! The internal interrupt latch raises IF bit 4 on every released ->
+//! pressed transition; holding a button does not refire it.
+
 // Button bitmask. The values are arbitrary — the joypad layout on the wire
 // is reconstructed in Joypad::read by combining state with the active
 // selection lines.
@@ -33,6 +42,9 @@ impl Joypad {
         }
     }
 
+    /// Synthesise the joypad register byte for `addr` (must be 0xFF00).
+    /// Bits 7..6 are hardwired high, 5..4 mirror the last CPU write,
+    /// and 3..0 are active-low for the buttons on the selected row(s).
     pub fn read(&self, addr: u16) -> u8 {
         match addr {
             0xff00 => {
@@ -75,6 +87,8 @@ impl Joypad {
         }
     }
 
+    /// Latch the row-select bits (5..4) at `addr` (must be 0xFF00).
+    /// Other bits are ignored — they're hardware-driven on read.
     pub fn write(&mut self, addr: u16, value: u8) {
         match addr {
             // Only bits 5..4 are writable; the rest are read-only on DMG.
@@ -94,6 +108,9 @@ impl Joypad {
         self.pressed = new_state;
     }
 
+    /// Consume the pending-interrupt flag. Returns true once per
+    /// released -> pressed transition; subsequent calls return false
+    /// until the next fresh press.
     pub fn take_interrupt(&mut self) -> bool {
         let pending = self.interrupt_pending;
         self.interrupt_pending = false;

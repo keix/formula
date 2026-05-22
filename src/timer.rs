@@ -1,3 +1,12 @@
+//! DIV / TIMA / TMA / TAC at 0xFF04-0xFF07.
+//!
+//! A single 16-bit counter increments every T-cycle and DIV (0xFF04)
+//! is its high byte, so any write to DIV clears the whole counter.
+//! TIMA increments on a falling edge of a selected counter bit (bit
+//! 9 / 3 / 5 / 7 for TAC clock 00 / 01 / 10 / 11 — i.e. every 1024
+//! / 16 / 64 / 256 T-cycles). When TIMA overflows it reloads from
+//! TMA and tick() returns true so the MMU can raise IF bit 2.
+
 pub struct Timer {
     counter: u16, // internal 16-bit counter; DIV is the high byte
     tima: u8,
@@ -15,6 +24,8 @@ impl Timer {
         }
     }
 
+    /// Read one of DIV / TIMA / TMA / TAC. TAC's upper 5 bits read
+    /// as 1 to match hardware open-bus behaviour.
     pub fn read(&self, addr: u16) -> u8 {
         match addr {
             0xff04 => (self.counter >> 8) as u8,
@@ -25,6 +36,9 @@ impl Timer {
         }
     }
 
+    /// Write one of DIV / TIMA / TMA / TAC. Writing DIV — regardless
+    /// of the value — clears the full 16-bit internal counter, not
+    /// just its high byte.
     pub fn write(&mut self, addr: u16, value: u8) {
         match addr {
             0xff04 => self.counter = 0, // any write to DIV clears the internal counter

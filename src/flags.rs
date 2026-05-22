@@ -1,3 +1,10 @@
+//! The CPU's F register, packed into a single byte.
+//!
+//! Layout follows the SM83 convention: bit 7 is Z (zero), 6 is N
+//! (subtract), 5 is H (half-carry), 4 is C (carry). The low nibble
+//! is always read as zero — the setters here keep that invariant
+//! even if a caller stuffs garbage into it via [`Flags::from_bits`].
+
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub struct Flags(u8);
 
@@ -49,10 +56,14 @@ impl Flags {
         self.0 &= 0xf0;
     }
 
+    /// Raw byte view, e.g. for pushing to the stack via `AF`.
     pub fn bits(self) -> u8 {
         self.0
     }
 
+    /// Build flags from a raw byte (e.g. popped from the stack). The
+    /// low nibble is masked off to preserve the hardware invariant
+    /// that bits 3..0 of F are wired to zero.
     pub fn from_bits(bits: u8) -> Self {
         Self(bits & 0xf0)
     }

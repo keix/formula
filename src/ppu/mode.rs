@@ -1,3 +1,5 @@
+//! The four PPU pipeline states and their STAT-register encoding.
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum PpuMode {
     HBlank,
@@ -7,7 +9,7 @@ pub enum PpuMode {
 }
 
 impl PpuMode {
-    /// The low two bits of the STAT register for this mode.
+    /// Encoding for the low two bits of the STAT register (0xFF41).
     pub fn stat_bits(self) -> u8 {
         match self {
             PpuMode::HBlank => 0b00,

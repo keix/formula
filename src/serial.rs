@@ -1,3 +1,14 @@
+//! Serial port (SB/SC at 0xFF01-0xFF02).
+//!
+//! The transfer model matches real DMG timing: writing the start bit
+//! with the internal clock selected schedules an 8-bit transfer that
+//! takes 8 * 512 T-cycles to drain, at which point SB lands in the
+//! output buffer and IF bit 3 is raised. Writing the start bit with
+//! the external clock instead latches SC and never completes on its
+//! own — there is no emulated link partner to drive the clock, and
+//! that is exactly the "is anyone there?" probe ROMs like Tetris use
+//! to detect a missing link cable.
+
 pub struct Serial {
     sb: u8,
     sc: u8,
@@ -22,6 +33,8 @@ impl Serial {
         }
     }
 
+    /// Read SB (0xFF01) or SC (0xFF02). Bit 7 of SC reflects an
+    /// in-flight transfer; bits 6..1 are hardwired high on DMG.
     pub fn read(&self, addr: u16) -> u8 {
         match addr {
             0xff01 => self.sb,
@@ -31,6 +44,10 @@ impl Serial {
         }
     }
 
+    /// Write SB or SC. Writing `0x81` to SC starts an internal-clock
+    /// transfer that takes 8 * 512 T-cycles to complete; writing
+    /// `0x80` (external clock) latches the start bit but never
+    /// completes without a link partner.
     pub fn write(&mut self, addr: u16, value: u8) {
         match addr {
             0xff01 => self.sb = value,
@@ -71,6 +88,8 @@ impl Serial {
         raise
     }
 
+    /// Take ownership of every byte the CPU has shipped via SB/SC
+    /// since the last call. The runner drains this into stdout.
     pub fn drain_output(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.output)
     }

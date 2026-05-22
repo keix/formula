@@ -1,3 +1,29 @@
+//! Picture Processing Unit
+//!
+//! Owns VRAM, OAM, the BG/Window/Sprite registers and the framebuffer
+//! the binary blits to screen. `tick(cycles)` advances the dot counter,
+//! cycles through OAM Search / Drawing / HBlank / VBlank, raises
+//! VBlank and STAT IRQs through the rising-edge of the STAT line, and
+//! returns the IF bits it wants set so the MMU can OR them in.
+//!
+//! Design notes:
+//! - Rendering is **scanline-coherent**: at the moment the line
+//!   transitions Drawing -> HBlank (dot 252 of LY < 144) we composite
+//!   the whole line in one shot — BG first, then Window over it, then
+//!   sprites with priority / transparency. Real hardware paints
+//!   pixel-by-pixel during Drawing; this is the practical shortcut
+//!   that lets dmg-acid2 hit pixel-perfect parity while keeping the
+//!   model simple. Per-scanline state (BG color index for sprite
+//!   priority, current LCDC/SCX/SCY/BGP samples) all reads from "the
+//!   value at HBlank entry" — so mid-line writes during Drawing
+//!   affect this line, and writes during HBlank affect the next.
+//! - The window has its own internal line counter (`wly`) that only
+//!   advances on lines where the window draws; it resets at the top
+//!   of every frame and when the LCD turns off, matching real DMG.
+//! - LCDC.7 (LCD enable) is a master gate: turning it off resets LY /
+//!   dots / mode / STAT line / wly, and tick() short-circuits until
+//!   it's re-enabled.
+
 mod framebuffer;
 mod mode;
 mod registers;
@@ -64,6 +90,9 @@ impl Ppu {
         }
     }
 
+    /// Read VRAM at `addr` (must be 0x8000-0x9FFF). The MMU routes
+    /// the VRAM window through here so the PPU is the single source
+    /// of truth for tile data and tilemaps.
     pub fn read_vram(&self, addr: u16) -> u8 {
         match addr {
             0x8000..=0x9fff => self.vram[(addr - 0x8000) as usize],
@@ -71,6 +100,7 @@ impl Ppu {
         }
     }
 
+    /// Write VRAM at `addr` (must be 0x8000-0x9FFF).
     pub fn write_vram(&mut self, addr: u16, value: u8) {
         match addr {
             0x8000..=0x9fff => self.vram[(addr - 0x8000) as usize] = value,
@@ -78,6 +108,8 @@ impl Ppu {
         }
     }
 
+    /// Read OAM at `addr` (must be 0xFE00-0xFE9F). The 40 sprite
+    /// entries (4 bytes each) live here; OAM DMA targets this region.
     pub fn read_oam(&self, addr: u16) -> u8 {
         match addr {
             0xfe00..=0xfe9f => self.oam[(addr - 0xfe00) as usize],
@@ -85,6 +117,7 @@ impl Ppu {
         }
     }
 
+    /// Write OAM at `addr` (must be 0xFE00-0xFE9F).
     pub fn write_oam(&mut self, addr: u16, value: u8) {
         match addr {
             0xfe00..=0xfe9f => self.oam[(addr - 0xfe00) as usize] = value,
@@ -92,14 +125,19 @@ impl Ppu {
         }
     }
 
+    /// Current pipeline mode (OAM Search / Drawing / HBlank / VBlank).
     pub fn mode(&self) -> PpuMode {
         self.mode
     }
 
+    /// The fully composited framebuffer for the most recent frame.
     pub fn framebuffer(&self) -> &Framebuffer {
         &self.framebuffer
     }
 
+    /// Read an LCD register (must be 0xFF40-0xFF4B, except 0xFF46
+    /// which the MMU services). STAT, LY=LYC coincidence, and the
+    /// mode bits are synthesised from current internal state.
     pub fn read(&self, addr: u16) -> u8 {
         match addr {
             0xff40 => self.regs.lcdc,
@@ -117,6 +155,9 @@ impl Ppu {
         }
     }
 
+    /// Write an LCD register. LCDC has its own setter (resetting
+    /// PPU state on LCD disable); STAT masks the read-only mode and
+    /// coincidence bits; LY is a write-to-zero register on DMG.
     pub fn write(&mut self, addr: u16, value: u8) {
         match addr {
             0xff40 => self.write_lcdc(value),
