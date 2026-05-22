@@ -131,6 +131,39 @@ mod tests {
     }
 
     #[test]
+    fn vram_covers_the_full_8kib_region() {
+        let mut mmu = make_mmu();
+        // Sweep across the 8 KiB window at 0x100-byte stride so every
+        // 256-byte page in VRAM is exercised.
+        for (i, addr) in (0x8000_u16..=0x9fff).step_by(0x100).enumerate() {
+            mmu.write8(addr, i as u8);
+        }
+        for (i, addr) in (0x8000_u16..=0x9fff).step_by(0x100).enumerate() {
+            assert_eq!(mmu.read8(addr), i as u8, "mismatch at {addr:#06x}");
+        }
+    }
+
+    #[test]
+    fn vram_does_not_alias_external_ram() {
+        let mut mmu = make_mmu();
+        // The 0x9fff/0xa000 boundary is the easiest place to write a
+        // routing off-by-one. Pin both sides with distinct sentinels.
+        mmu.write8(0x9fff, 0x11);
+        mmu.write8(0xa000, 0x22);
+        assert_eq!(mmu.read8(0x9fff), 0x11);
+        assert_eq!(mmu.read8(0xa000), 0x22);
+    }
+
+    #[test]
+    fn vram_does_not_alias_wram() {
+        let mut mmu = make_mmu();
+        mmu.write8(0x8000, 0xaa);
+        mmu.write8(0xc000, 0x55);
+        assert_eq!(mmu.read8(0x8000), 0xaa);
+        assert_eq!(mmu.read8(0xc000), 0x55);
+    }
+
+    #[test]
     fn external_ram_roundtrip() {
         let mut mmu = make_mmu();
 
@@ -178,6 +211,39 @@ mod tests {
 
         assert_eq!(mmu.read8(0xfe00), 0xab);
         assert_eq!(mmu.read8(0xfe9f), 0xcd);
+    }
+
+    #[test]
+    fn oam_covers_the_full_a0_byte_region() {
+        let mut mmu = make_mmu();
+        for (i, addr) in (0xfe00_u16..=0xfe9f).step_by(0x10).enumerate() {
+            mmu.write8(addr, i as u8);
+        }
+        for (i, addr) in (0xfe00_u16..=0xfe9f).step_by(0x10).enumerate() {
+            assert_eq!(mmu.read8(addr), i as u8, "mismatch at {addr:#06x}");
+        }
+    }
+
+    #[test]
+    fn oam_does_not_leak_into_unusable_area() {
+        let mut mmu = make_mmu();
+        // Last byte of OAM stays distinct from the first byte of the
+        // unusable region, which always reads 0xFF and swallows writes.
+        mmu.write8(0xfe9f, 0x42);
+        mmu.write8(0xfea0, 0x42);
+        assert_eq!(mmu.read8(0xfe9f), 0x42);
+        assert_eq!(mmu.read8(0xfea0), 0xff);
+    }
+
+    #[test]
+    fn oam_does_not_alias_wram_echo_tail() {
+        let mut mmu = make_mmu();
+        // 0xFDFF is the last byte of the echo-of-WRAM region; 0xFE00 is the
+        // first byte of OAM. Two completely different stores.
+        mmu.write8(0xfdff, 0x77);
+        mmu.write8(0xfe00, 0x88);
+        assert_eq!(mmu.read8(0xfdff), 0x77);
+        assert_eq!(mmu.read8(0xfe00), 0x88);
     }
 
     #[test]

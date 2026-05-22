@@ -439,4 +439,37 @@ mod tests {
         }
         assert_eq!(total, 0);
     }
+
+    // Lock in the register-window contract before VRAM lands in PPU: the
+    // read/write methods cover 0xFF40-0xFF4B and panic on anything else.
+    // The MMU is the only caller and it never strays outside, but pinning
+    // the bounds keeps the upcoming refactor honest.
+
+    #[test]
+    #[should_panic(expected = "PPU: unmapped read")]
+    fn ppu_read_just_below_register_window_panics() {
+        let ppu = Ppu::new();
+        let _ = ppu.read(0xff3f);
+    }
+
+    #[test]
+    #[should_panic(expected = "PPU: unmapped read")]
+    fn ppu_read_just_above_register_window_panics() {
+        let ppu = Ppu::new();
+        let _ = ppu.read(0xff4c);
+    }
+
+    #[test]
+    #[should_panic(expected = "PPU: unmapped write")]
+    fn ppu_write_just_below_register_window_panics() {
+        let mut ppu = Ppu::new();
+        ppu.write(0xff3f, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "PPU: unmapped write")]
+    fn ppu_write_just_above_register_window_panics() {
+        let mut ppu = Ppu::new();
+        ppu.write(0xff4c, 0);
+    }
 }
