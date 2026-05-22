@@ -54,8 +54,7 @@ fn rom_can_print_bytes_through_serial_link() {
 
     let mut output: Vec<u8> = Vec::new();
     for _ in 0..20_000 {
-        let cycles = cpu.step(&mut mmu);
-        mmu.tick(cycles);
+        cpu.step(&mut mmu);
         output.extend(mmu.drain_serial_output());
         if output == b"AB" {
             return;

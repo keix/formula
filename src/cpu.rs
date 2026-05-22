@@ -96,13 +96,37 @@ impl Cpu {
         [self.h, self.l] = value.to_be_bytes();
     }
 
+    fn mcycle(&mut self, bus: &mut impl Bus) {
+        bus.tick(4);
+    }
+
+    fn idle(&mut self, bus: &mut impl Bus) {
+        self.mcycle(bus);
+    }
+
+    fn read8_timed(&mut self, bus: &mut impl Bus, addr: u16) -> u8 {
+        self.mcycle(bus);
+        bus.read8(addr)
+    }
+
+    fn write8_timed(&mut self, bus: &mut impl Bus, addr: u16, value: u8) {
+        self.mcycle(bus);
+        bus.write8(addr, value);
+    }
+
     fn fetch8(&mut self, bus: &mut impl Bus) -> u8 {
-        let byte = bus.read8(self.pc);
+        let byte = self.read8_timed(bus, self.pc);
         if self.halt_bug {
             self.halt_bug = false;
         } else {
             self.pc = self.pc.wrapping_add(1);
         }
+        byte
+    }
+
+    fn consume_operand_untimed(&mut self, bus: &impl Bus) -> u8 {
+        let byte = bus.read8(self.pc);
+        self.pc = self.pc.wrapping_add(1);
         byte
     }
 
@@ -115,20 +139,20 @@ impl Cpu {
     fn push16(&mut self, bus: &mut impl Bus, value: u16) {
         let [hi, lo] = value.to_be_bytes();
         self.sp = self.sp.wrapping_sub(1);
-        bus.write8(self.sp, hi);
+        self.write8_timed(bus, self.sp, hi);
         self.sp = self.sp.wrapping_sub(1);
-        bus.write8(self.sp, lo);
+        self.write8_timed(bus, self.sp, lo);
     }
 
     fn pop16(&mut self, bus: &mut impl Bus) -> u16 {
-        let lo = bus.read8(self.sp);
+        let lo = self.read8_timed(bus, self.sp);
         self.sp = self.sp.wrapping_add(1);
-        let hi = bus.read8(self.sp);
+        let hi = self.read8_timed(bus, self.sp);
         self.sp = self.sp.wrapping_add(1);
         u16::from_be_bytes([hi, lo])
     }
 
-    fn read_r(&self, idx: u8, bus: &impl Bus) -> u8 {
+    fn read_r(&mut self, idx: u8, bus: &mut impl Bus) -> u8 {
         match idx & 7 {
             0 => self.b,
             1 => self.c,
@@ -136,7 +160,7 @@ impl Cpu {
             3 => self.e,
             4 => self.h,
             5 => self.l,
-            6 => bus.read8(self.hl()),
+            6 => self.read8_timed(bus, self.hl()),
             7 => self.a,
             _ => unreachable!(),
         }
@@ -150,7 +174,7 @@ impl Cpu {
             3 => self.e = value,
             4 => self.h = value,
             5 => self.l = value,
-            6 => bus.write8(self.hl(), value),
+            6 => self.write8_timed(bus, self.hl(), value),
             7 => self.a = value,
             _ => unreachable!(),
         }
@@ -287,6 +311,7 @@ impl Cpu {
     fn jr_cc(&mut self, cc: u8, bus: &mut impl Bus) -> u8 {
         let e = self.fetch8(bus) as i8;
         if self.cc_satisfied(cc) {
+            self.idle(bus);
             self.pc = self.pc.wrapping_add_signed(i16::from(e));
             12
         } else {
@@ -297,6 +322,7 @@ impl Cpu {
     fn jp_cc(&mut self, cc: u8, bus: &mut impl Bus) -> u8 {
         let nn = self.fetch16(bus);
         if self.cc_satisfied(cc) {
+            self.idle(bus);
             self.pc = nn;
             16
         } else {
@@ -306,6 +332,7 @@ impl Cpu {
 
     fn call_nn(&mut self, bus: &mut impl Bus) -> u8 {
         let nn = self.fetch16(bus);
+        self.idle(bus);
         self.push16(bus, self.pc);
         self.pc = nn;
         24
@@ -314,6 +341,7 @@ impl Cpu {
     fn call_cc(&mut self, cc: u8, bus: &mut impl Bus) -> u8 {
         let nn = self.fetch16(bus);
         if self.cc_satisfied(cc) {
+            self.idle(bus);
             self.push16(bus, self.pc);
             self.pc = nn;
             24
@@ -324,14 +352,18 @@ impl Cpu {
 
     fn ret_cc(&mut self, cc: u8, bus: &mut impl Bus) -> u8 {
         if self.cc_satisfied(cc) {
+            self.idle(bus);
             self.pc = self.pop16(bus);
+            self.idle(bus);
             20
         } else {
+            self.idle(bus);
             8
         }
     }
 
     fn rst(&mut self, vector: u16, bus: &mut impl Bus) -> u8 {
+        self.idle(bus);
         self.push16(bus, self.pc);
         self.pc = vector;
         16
@@ -516,6 +548,9 @@ impl Cpu {
         let if_ = bus.read8(0xff0f);
         bus.write8(0xff0f, if_ & !(1u8 << bit));
 
+        self.idle(bus);
+        self.idle(bus);
+        self.idle(bus);
         self.push16(bus, self.pc);
         self.pc = vector;
 
@@ -537,6 +572,7 @@ impl Cpu {
     /// the rest of the system should advance by.
     pub fn step(&mut self, bus: &mut impl Bus) -> u8 {
         if self.locked {
+            self.idle(bus);
             return 4;
         }
 
@@ -551,6 +587,7 @@ impl Cpu {
         }
 
         if self.halted {
+            self.idle(bus);
             return 4;
         }
 
@@ -563,10 +600,11 @@ impl Cpu {
                 12
             }
             0x02 => {
-                bus.write8(self.bc(), self.a);
+                self.write8_timed(bus, self.bc(), self.a);
                 8
             }
             0x03 => {
+                self.idle(bus);
                 self.set_bc(self.bc().wrapping_add(1));
                 8
             }
@@ -584,19 +622,21 @@ impl Cpu {
             0x08 => {
                 let nn = self.fetch16(bus);
                 let [hi, lo] = self.sp.to_be_bytes();
-                bus.write8(nn, lo);
-                bus.write8(nn.wrapping_add(1), hi);
+                self.write8_timed(bus, nn, lo);
+                self.write8_timed(bus, nn.wrapping_add(1), hi);
                 20
             }
             0x09 => {
+                self.idle(bus);
                 self.add_hl(self.bc());
                 8
             }
             0x0a => {
-                self.a = bus.read8(self.bc());
+                self.a = self.read8_timed(bus, self.bc());
                 8
             }
             0x0b => {
+                self.idle(bus);
                 self.set_bc(self.bc().wrapping_sub(1));
                 8
             }
@@ -615,7 +655,7 @@ impl Cpu {
                 // STOP — encoded as 0x10 0x00. We consume the operand byte
                 // and reset DIV. The low-power / LCD-off semantics aren't
                 // modeled; the CPU keeps executing the next instruction.
-                let _ = self.fetch8(bus);
+                let _ = self.consume_operand_untimed(bus);
                 bus.write8(0xff04, 0);
                 4
             }
@@ -625,10 +665,11 @@ impl Cpu {
                 12
             }
             0x12 => {
-                bus.write8(self.de(), self.a);
+                self.write8_timed(bus, self.de(), self.a);
                 8
             }
             0x13 => {
+                self.idle(bus);
                 self.set_de(self.de().wrapping_add(1));
                 8
             }
@@ -645,18 +686,21 @@ impl Cpu {
             }
             0x18 => {
                 let e = self.fetch8(bus) as i8;
+                self.idle(bus);
                 self.pc = self.pc.wrapping_add_signed(i16::from(e));
                 12
             }
             0x19 => {
+                self.idle(bus);
                 self.add_hl(self.de());
                 8
             }
             0x1a => {
-                self.a = bus.read8(self.de());
+                self.a = self.read8_timed(bus, self.de());
                 8
             }
             0x1b => {
+                self.idle(bus);
                 self.set_de(self.de().wrapping_sub(1));
                 8
             }
@@ -678,11 +722,12 @@ impl Cpu {
                 12
             }
             0x22 => {
-                bus.write8(self.hl(), self.a);
+                self.write8_timed(bus, self.hl(), self.a);
                 self.set_hl(self.hl().wrapping_add(1));
                 8
             }
             0x23 => {
+                self.idle(bus);
                 self.set_hl(self.hl().wrapping_add(1));
                 8
             }
@@ -698,15 +743,17 @@ impl Cpu {
             }
             0x28 => self.jr_cc(1, bus), // JR Z, e
             0x29 => {
+                self.idle(bus);
                 self.add_hl(self.hl());
                 8
             }
             0x2a => {
-                self.a = bus.read8(self.hl());
+                self.a = self.read8_timed(bus, self.hl());
                 self.set_hl(self.hl().wrapping_add(1));
                 8
             }
             0x2b => {
+                self.idle(bus);
                 self.set_hl(self.hl().wrapping_sub(1));
                 8
             }
@@ -728,11 +775,12 @@ impl Cpu {
                 12
             }
             0x32 => {
-                bus.write8(self.hl(), self.a);
+                self.write8_timed(bus, self.hl(), self.a);
                 self.set_hl(self.hl().wrapping_sub(1));
                 8
             }
             0x33 => {
+                self.idle(bus);
                 self.sp = self.sp.wrapping_add(1);
                 8
             }
@@ -740,7 +788,7 @@ impl Cpu {
             0x35 => self.dec_r(6, bus),
             0x36 => {
                 let n = self.fetch8(bus);
-                bus.write8(self.hl(), n);
+                self.write8_timed(bus, self.hl(), n);
                 12
             }
             0x37 => {
@@ -751,15 +799,17 @@ impl Cpu {
             }
             0x38 => self.jr_cc(3, bus), // JR C, e
             0x39 => {
+                self.idle(bus);
                 self.add_hl(self.sp);
                 8
             }
             0x3a => {
-                self.a = bus.read8(self.hl());
+                self.a = self.read8_timed(bus, self.hl());
                 self.set_hl(self.hl().wrapping_sub(1));
                 8
             }
             0x3b => {
+                self.idle(bus);
                 self.sp = self.sp.wrapping_sub(1);
                 8
             }
@@ -825,10 +875,12 @@ impl Cpu {
             0xc2 => self.jp_cc(0, bus), // JP NZ, nn
             0xc3 => {
                 self.pc = self.fetch16(bus);
+                self.idle(bus);
                 16
             }
             0xc4 => self.call_cc(0, bus), // CALL NZ
             0xc5 => {
+                self.idle(bus);
                 self.push16(bus, self.bc());
                 16
             }
@@ -841,6 +893,7 @@ impl Cpu {
             0xc8 => self.ret_cc(1, bus), // RET Z
             0xc9 => {
                 self.pc = self.pop16(bus);
+                self.idle(bus);
                 16
             }
             0xca => self.jp_cc(1, bus), // JP Z, nn
@@ -862,6 +915,7 @@ impl Cpu {
             0xd2 => self.jp_cc(2, bus),   // JP NC, nn
             0xd4 => self.call_cc(2, bus), // CALL NC
             0xd5 => {
+                self.idle(bus);
                 self.push16(bus, self.de());
                 16
             }
@@ -874,6 +928,7 @@ impl Cpu {
             0xd8 => self.ret_cc(3, bus), // RET C
             0xd9 => {
                 self.pc = self.pop16(bus);
+                self.idle(bus);
                 self.ime = true;
                 self.ime_delay = 0;
                 16
@@ -888,7 +943,7 @@ impl Cpu {
             0xdf => self.rst(0x0018, bus),
             0xe0 => {
                 let n = self.fetch8(bus);
-                bus.write8(0xff00 + u16::from(n), self.a);
+                self.write8_timed(bus, 0xff00 + u16::from(n), self.a);
                 12
             }
             0xe1 => {
@@ -897,10 +952,11 @@ impl Cpu {
                 12
             }
             0xe2 => {
-                bus.write8(0xff00 + u16::from(self.c), self.a);
+                self.write8_timed(bus, 0xff00 + u16::from(self.c), self.a);
                 8
             }
             0xe5 => {
+                self.idle(bus);
                 self.push16(bus, self.hl());
                 16
             }
@@ -912,6 +968,8 @@ impl Cpu {
             0xe7 => self.rst(0x0020, bus),
             0xe8 => {
                 let e = self.fetch8(bus) as i8;
+                self.idle(bus);
+                self.idle(bus);
                 self.sp = self.add_sp_e(e);
                 16
             }
@@ -921,7 +979,7 @@ impl Cpu {
             }
             0xea => {
                 let nn = self.fetch16(bus);
-                bus.write8(nn, self.a);
+                self.write8_timed(bus, nn, self.a);
                 16
             }
             0xee => {
@@ -932,7 +990,7 @@ impl Cpu {
             0xef => self.rst(0x0028, bus),
             0xf0 => {
                 let n = self.fetch8(bus);
-                self.a = bus.read8(0xff00 + u16::from(n));
+                self.a = self.read8_timed(bus, 0xff00 + u16::from(n));
                 12
             }
             0xf1 => {
@@ -941,7 +999,7 @@ impl Cpu {
                 12
             }
             0xf2 => {
-                self.a = bus.read8(0xff00 + u16::from(self.c));
+                self.a = self.read8_timed(bus, 0xff00 + u16::from(self.c));
                 8
             }
             0xf3 => {
@@ -950,6 +1008,7 @@ impl Cpu {
                 4
             }
             0xf5 => {
+                self.idle(bus);
                 self.push16(bus, self.af());
                 16
             }
@@ -961,17 +1020,19 @@ impl Cpu {
             0xf7 => self.rst(0x0030, bus),
             0xf8 => {
                 let e = self.fetch8(bus) as i8;
+                self.idle(bus);
                 let v = self.add_sp_e(e);
                 self.set_hl(v);
                 12
             }
             0xf9 => {
+                self.idle(bus);
                 self.sp = self.hl();
                 8
             }
             0xfa => {
                 let nn = self.fetch16(bus);
-                self.a = bus.read8(nn);
+                self.a = self.read8_timed(bus, nn);
                 16
             }
             0xfb => {
@@ -1007,6 +1068,55 @@ impl Default for Cpu {
 mod tests {
     use super::*;
     use crate::memory::Memory;
+    use std::cell::Cell;
+
+    struct TimingBus {
+        ticks: Cell<u32>,
+        hl_addr: u16,
+        wrote_at: Cell<u32>,
+        wrote_value: Cell<u8>,
+    }
+
+    impl TimingBus {
+        fn new(hl_addr: u16) -> Self {
+            Self {
+                ticks: Cell::new(0),
+                hl_addr,
+                wrote_at: Cell::new(u32::MAX),
+                wrote_value: Cell::new(0),
+            }
+        }
+    }
+
+    impl Bus for TimingBus {
+        fn read8(&self, addr: u16) -> u8 {
+            match addr {
+                0x0000 => 0xf0, // LDH A, (n)
+                0x0001 => 0x05, // TIMA
+                0x0100 => 0x34, // INC (HL)
+                0xff05 => {
+                    if self.ticks.get() >= 5 {
+                        0x34
+                    } else {
+                        0x12
+                    }
+                }
+                addr if addr == self.hl_addr => 0x7f,
+                _ => 0x00,
+            }
+        }
+
+        fn write8(&mut self, addr: u16, value: u8) {
+            if addr == self.hl_addr {
+                self.wrote_at.set(self.ticks.get());
+                self.wrote_value.set(value);
+            }
+        }
+
+        fn tick(&mut self, cycles: u8) {
+            self.ticks.set(self.ticks.get() + u32::from(cycles));
+        }
+    }
 
     #[test]
     fn nop_then_halt() {
@@ -1078,6 +1188,33 @@ mod tests {
         assert_eq!(cpu.step(&mut mem), 8); // LD A, n
         assert_eq!(cpu.step(&mut mem), 4); // HALT
         assert_eq!(cpu.step(&mut mem), 4); // halted -> 1 M-cycle
+    }
+
+    #[test]
+    fn ldh_a_n_reads_after_the_intermediate_m_cycles() {
+        let mut cpu = Cpu::new();
+        let mut bus = TimingBus::new(0xc000);
+
+        let cycles = cpu.step(&mut bus);
+
+        assert_eq!(cycles, 12);
+        assert_eq!(cpu.a, 0x34);
+        assert_eq!(bus.ticks.get(), 12);
+    }
+
+    #[test]
+    fn inc_indirect_hl_reads_then_writes_on_later_m_cycle() {
+        let mut cpu = Cpu::new();
+        let mut bus = TimingBus::new(0xc000);
+        cpu.pc = 0x0100;
+        cpu.set_hl(0xc000);
+
+        let cycles = cpu.step(&mut bus);
+
+        assert_eq!(cycles, 12);
+        assert_eq!(bus.wrote_value.get(), 0x80);
+        assert_eq!(bus.wrote_at.get(), 12);
+        assert_eq!(bus.ticks.get(), 12);
     }
 
     #[test]
@@ -1179,14 +1316,14 @@ mod tests {
         cpu.a = 0xa0;
         mem.write8(0x4050, 0x66);
 
-        assert_eq!(cpu.read_r(0, &mem), 0xb0); // B
-        assert_eq!(cpu.read_r(1, &mem), 0xc0); // C
-        assert_eq!(cpu.read_r(2, &mem), 0xd0); // D
-        assert_eq!(cpu.read_r(3, &mem), 0xe0); // E
-        assert_eq!(cpu.read_r(4, &mem), 0x40); // H
-        assert_eq!(cpu.read_r(5, &mem), 0x50); // L
-        assert_eq!(cpu.read_r(6, &mem), 0x66); // (HL)
-        assert_eq!(cpu.read_r(7, &mem), 0xa0); // A
+        assert_eq!(cpu.read_r(0, &mut mem), 0xb0); // B
+        assert_eq!(cpu.read_r(1, &mut mem), 0xc0); // C
+        assert_eq!(cpu.read_r(2, &mut mem), 0xd0); // D
+        assert_eq!(cpu.read_r(3, &mut mem), 0xe0); // E
+        assert_eq!(cpu.read_r(4, &mut mem), 0x40); // H
+        assert_eq!(cpu.read_r(5, &mut mem), 0x50); // L
+        assert_eq!(cpu.read_r(6, &mut mem), 0x66); // (HL)
+        assert_eq!(cpu.read_r(7, &mut mem), 0xa0); // A
     }
 
     #[test]
@@ -2463,7 +2600,7 @@ mod tests {
 
             let cycles = cpu.step(&mut mem);
 
-            assert_eq!(cpu.read_r(idx, &mem), 0x43, "idx {idx}");
+            assert_eq!(cpu.read_r(idx, &mut mem), 0x43, "idx {idx}");
             assert!(!cpu.f.n(), "N must be 0 for INC, idx {idx}");
             assert!(cpu.f.c(), "C must be preserved, idx {idx}");
             let expected = if idx == 6 { 12 } else { 4 };
@@ -2484,7 +2621,7 @@ mod tests {
 
             let cycles = cpu.step(&mut mem);
 
-            assert_eq!(cpu.read_r(idx, &mem), 0x41, "idx {idx}");
+            assert_eq!(cpu.read_r(idx, &mut mem), 0x41, "idx {idx}");
             assert!(cpu.f.n(), "N must be 1 for DEC, idx {idx}");
             assert!(cpu.f.c(), "C must be preserved, idx {idx}");
             let expected = if idx == 6 { 12 } else { 4 };

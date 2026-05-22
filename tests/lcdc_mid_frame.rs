@@ -91,8 +91,7 @@ fn run_one_frame(rom: Vec<u8>) -> Mmu {
     let mut mmu = Mmu::new(Box::new(Mbc0::new(rom)));
     let mut cpu = post_boot_cpu();
     for _ in 0..200_000 {
-        let cycles = cpu.step(&mut mmu);
-        mmu.tick(cycles);
+        cpu.step(&mut mmu);
         if mmu.take_frame_ready() {
             return mmu;
         }

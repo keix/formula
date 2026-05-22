@@ -167,6 +167,10 @@ impl Bus for Mmu {
             0xffff => self.ie = value,
         }
     }
+
+    fn tick(&mut self, cycles: u8) {
+        Mmu::tick(self, cycles);
+    }
 }
 
 #[cfg(test)]

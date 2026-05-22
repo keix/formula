@@ -69,8 +69,7 @@ fn dmg_acid2_matches_reference_image() {
     // 10 frames in. Run 12 frames so we sample well past that boundary.
     let mut frames = 0;
     while frames < 12 {
-        let cycles = cpu.step(&mut mmu);
-        mmu.tick(cycles);
+        cpu.step(&mut mmu);
         if mmu.take_frame_ready() {
             frames += 1;
         }

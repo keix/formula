@@ -49,8 +49,7 @@ fn timer_overflow_jumps_cpu_to_vector_0x50() {
     // long before this. Replace with a deterministic bound once a top-level
     // driver tracks total elapsed cycles.
     for _ in 0..1024 {
-        let cycles = cpu.step(&mut mmu);
-        mmu.tick(cycles);
+        cpu.step(&mut mmu);
         if cpu.halted {
             break;
         }
