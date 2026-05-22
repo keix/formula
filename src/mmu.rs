@@ -46,6 +46,7 @@ pub struct Mmu {
     // If the most recent CPU M-cycle overlapped a single mode-2 OAM scan row,
     // cache that row so the following CPU access can apply the DMG OAM bug.
     last_oam_bug_row: Option<usize>,
+    last_oam_bug_row_before_tick: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -72,6 +73,7 @@ impl Mmu {
             dma: 0,
             frame_ready: false,
             last_oam_bug_row: None,
+            last_oam_bug_row_before_tick: None,
         }
     }
 
@@ -144,7 +146,7 @@ impl Mmu {
     }
 
     fn apply_oam_read_idu_corruption(&mut self, row: usize) {
-        if row >= 2 {
+        if (4..19).contains(&row) {
             let a = self.oam_word(row - 2, 0);
             let b = self.oam_word(row - 1, 0);
             let c = self.oam_word(row, 0);
@@ -180,6 +182,7 @@ impl Mmu {
     /// Advance memory-mapped sub-systems by `cycles` T-cycles. Subsystems
     /// that raise interrupts set the corresponding bit in IF (0xFF0F).
     pub fn tick(&mut self, cycles: u8) {
+        self.last_oam_bug_row_before_tick = self.ppu.oam_bug_row_for_access();
         if self.timer.tick(cycles) {
             self.io[0x0f] |= 0x04; // Timer interrupt -> IF bit 2
         }
@@ -284,6 +287,17 @@ impl Bus for Mmu {
     fn read8_cpu_idu(&mut self, addr: u16, idu_addr: u16) -> u8 {
         let value = self.read8(addr);
         self.maybe_apply_oam_bug(idu_addr, OamBugKind::ReadIdu);
+        value
+    }
+
+    fn read8_cpu_pop(&mut self, addr: u16, idu_addr: u16) -> u8 {
+        let value = self.read8(addr);
+        if (0xfe00..=0xfeff).contains(&idu_addr) {
+            if let Some(row) = self.last_oam_bug_row_before_tick {
+                self.apply_oam_write_corruption(row);
+            }
+        }
+        self.maybe_apply_oam_bug(addr, OamBugKind::Read);
         value
     }
 
