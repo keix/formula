@@ -130,6 +130,22 @@ impl Ppu {
         self.mode
     }
 
+    /// If a CPU M-cycle of `cycles` dots starts right now during mode 2,
+    /// return the OAM row (0..19) the PPU is scanning in that M-cycle.
+    pub fn oam_bug_row_for_chunk(&self, cycles: u8) -> Option<usize> {
+        if (self.regs.lcdc & LCDC_LCD_ENABLE) == 0 || self.regs.ly >= 144 || self.dots >= 80 {
+            return None;
+        }
+
+        let start_row = usize::from(self.dots / 4);
+        let end_dot = self.dots + u16::from(cycles).saturating_sub(1);
+        if end_dot >= 80 || usize::from(end_dot / 4) != start_row {
+            return None;
+        }
+
+        Some(start_row)
+    }
+
     /// The fully composited framebuffer for the most recent frame.
     pub fn framebuffer(&self) -> &Framebuffer {
         &self.framebuffer

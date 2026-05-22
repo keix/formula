@@ -43,6 +43,10 @@ pub struct Mmu {
     // Set when the PPU just entered VBlank (i.e. completed a frame).
     // The display loop consumes this via take_frame_ready().
     frame_ready: bool,
+    // The OAM row (0..19) the PPU scanned during the most recent CPU-size
+    // M-cycle. The DMG OAM corruption bug uses the currently scanned row
+    // during mode 2 and ignores the actual CPU access address/value.
+    last_oam_bug_row: Option<usize>,
 }
 
 impl Mmu {
@@ -59,6 +63,82 @@ impl Mmu {
             ie: 0,
             dma: 0,
             frame_ready: false,
+            last_oam_bug_row: None,
+        }
+    }
+
+    fn oam_word(&self, row: usize, word: usize) -> u16 {
+        let base = 0xfe00 + (row as u16) * 8 + (word as u16) * 2;
+        u16::from_le_bytes([self.ppu.read_oam(base), self.ppu.read_oam(base + 1)])
+    }
+
+    fn set_oam_word(&mut self, row: usize, word: usize, value: u16) {
+        let base = 0xfe00 + (row as u16) * 8 + (word as u16) * 2;
+        let [lo, hi] = value.to_le_bytes();
+        self.ppu.write_oam(base, lo);
+        self.ppu.write_oam(base + 1, hi);
+    }
+
+    fn apply_oam_write_corruption(&mut self, row: usize) {
+        if row == 0 {
+            return;
+        }
+
+        let a = self.oam_word(row, 0);
+        let b = self.oam_word(row - 1, 0);
+        let c = self.oam_word(row - 1, 2);
+        self.set_oam_word(row, 0, ((a ^ c) & (b ^ c)) ^ c);
+        for word in 1..4 {
+            self.set_oam_word(row, word, self.oam_word(row - 1, word));
+        }
+    }
+
+    fn apply_oam_read_corruption(&mut self, row: usize) {
+        if row == 0 {
+            return;
+        }
+
+        let a = self.oam_word(row, 0);
+        let b = self.oam_word(row - 1, 0);
+        let c = self.oam_word(row - 1, 2);
+        self.set_oam_word(row, 0, b | (a & c));
+        for word in 1..4 {
+            self.set_oam_word(row, word, self.oam_word(row - 1, word));
+        }
+    }
+
+    fn apply_oam_read_idu_corruption(&mut self, row: usize) {
+        if (4..19).contains(&row) {
+            let a = self.oam_word(row - 2, 0);
+            let b = self.oam_word(row - 1, 0);
+            let c = self.oam_word(row, 0);
+            let d = self.oam_word(row - 1, 2);
+            self.set_oam_word(row - 1, 0, (b & (a | c | d)) | (a & c & d));
+
+            for word in 0..4 {
+                let value = self.oam_word(row - 1, word);
+                self.set_oam_word(row, word, value);
+                self.set_oam_word(row - 2, word, value);
+            }
+        }
+
+        self.apply_oam_read_corruption(row);
+    }
+
+    fn maybe_apply_oam_bug(&mut self, addr: u16, kind: OamBugKind) {
+        if !(0xfe00..=0xfeff).contains(&addr) {
+            return;
+        }
+        let Some(row) = self.last_oam_bug_row else {
+            return;
+        };
+
+        match kind {
+            OamBugKind::Read => self.apply_oam_read_corruption(row),
+            OamBugKind::Write | OamBugKind::IduWrite | OamBugKind::WriteIdu => {
+                self.apply_oam_write_corruption(row)
+            }
+            OamBugKind::ReadIdu => self.apply_oam_read_idu_corruption(row),
         }
     }
 
@@ -87,6 +167,7 @@ impl Mmu {
     /// Advance memory-mapped sub-systems by `cycles` T-cycles. Subsystems
     /// that raise interrupts set the corresponding bit in IF (0xFF0F).
     pub fn tick(&mut self, cycles: u8) {
+        self.last_oam_bug_row = self.ppu.oam_bug_row_for_chunk(cycles);
         if self.timer.tick(cycles) {
             self.io[0x0f] |= 0x04; // Timer interrupt -> IF bit 2
         }
@@ -119,6 +200,15 @@ impl Mmu {
     pub fn framebuffer(&self) -> &Framebuffer {
         self.ppu.framebuffer()
     }
+}
+
+#[derive(Clone, Copy)]
+enum OamBugKind {
+    Read,
+    Write,
+    IduWrite,
+    ReadIdu,
+    WriteIdu,
 }
 
 impl Bus for Mmu {
@@ -170,6 +260,30 @@ impl Bus for Mmu {
 
     fn tick(&mut self, cycles: u8) {
         Mmu::tick(self, cycles);
+    }
+
+    fn cpu_read8(&mut self, addr: u16) -> u8 {
+        self.maybe_apply_oam_bug(addr, OamBugKind::Read);
+        self.read8(addr)
+    }
+
+    fn cpu_write8(&mut self, addr: u16, value: u8) {
+        self.maybe_apply_oam_bug(addr, OamBugKind::Write);
+        self.write8(addr, value);
+    }
+
+    fn cpu_read8_idu(&mut self, addr: u16) -> u8 {
+        self.maybe_apply_oam_bug(addr, OamBugKind::ReadIdu);
+        self.read8(addr)
+    }
+
+    fn cpu_write8_idu(&mut self, addr: u16, value: u8) {
+        self.maybe_apply_oam_bug(addr, OamBugKind::WriteIdu);
+        self.write8(addr, value);
+    }
+
+    fn cpu_idu_glitch(&mut self, addr: u16) {
+        self.maybe_apply_oam_bug(addr, OamBugKind::IduWrite);
     }
 }
 
@@ -401,8 +515,9 @@ mod tests {
         mmu.write8(0xff06, 0x00); // TMA
         mmu.write8(0xff07, 0x05); // enable, clock 01 (every 16 cycles)
 
-        // Run 16 T-cycles to trigger overflow
-        mmu.tick(16);
+        // 16 T-cycles reaches the overflow edge, then 4 more cycles reload
+        // TIMA from TMA and raise IF bit 2.
+        mmu.tick(20);
 
         // IF (0xff0f) should have bit 2 set
         assert_eq!(mmu.read8(0xff0f) & 0x04, 0x04);
@@ -417,7 +532,7 @@ mod tests {
         mmu.write8(0xff05, 0xff);
         mmu.write8(0xff07, 0x05);
 
-        mmu.tick(16);
+        mmu.tick(20);
 
         // Both VBlank (bit 0) and Timer (bit 2) should be set
         assert_eq!(mmu.read8(0xff0f) & 0x05, 0x05);

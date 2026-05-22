@@ -106,12 +106,27 @@ impl Cpu {
 
     fn read8_timed(&mut self, bus: &mut impl Bus, addr: u16) -> u8 {
         self.mcycle(bus);
-        bus.read8(addr)
+        bus.cpu_read8(addr)
     }
 
     fn write8_timed(&mut self, bus: &mut impl Bus, addr: u16, value: u8) {
         self.mcycle(bus);
-        bus.write8(addr, value);
+        bus.cpu_write8(addr, value);
+    }
+
+    fn read8_timed_idu(&mut self, bus: &mut impl Bus, addr: u16) -> u8 {
+        self.mcycle(bus);
+        bus.cpu_read8_idu(addr)
+    }
+
+    fn write8_timed_idu(&mut self, bus: &mut impl Bus, addr: u16, value: u8) {
+        self.mcycle(bus);
+        bus.cpu_write8_idu(addr, value);
+    }
+
+    fn idu_timed(&mut self, bus: &mut impl Bus, addr: u16) {
+        self.mcycle(bus);
+        bus.cpu_idu_glitch(addr);
     }
 
     fn fetch8(&mut self, bus: &mut impl Bus) -> u8 {
@@ -604,7 +619,7 @@ impl Cpu {
                 8
             }
             0x03 => {
-                self.idle(bus);
+                self.idu_timed(bus, self.bc());
                 self.set_bc(self.bc().wrapping_add(1));
                 8
             }
@@ -636,7 +651,7 @@ impl Cpu {
                 8
             }
             0x0b => {
-                self.idle(bus);
+                self.idu_timed(bus, self.bc());
                 self.set_bc(self.bc().wrapping_sub(1));
                 8
             }
@@ -669,7 +684,7 @@ impl Cpu {
                 8
             }
             0x13 => {
-                self.idle(bus);
+                self.idu_timed(bus, self.de());
                 self.set_de(self.de().wrapping_add(1));
                 8
             }
@@ -700,7 +715,7 @@ impl Cpu {
                 8
             }
             0x1b => {
-                self.idle(bus);
+                self.idu_timed(bus, self.de());
                 self.set_de(self.de().wrapping_sub(1));
                 8
             }
@@ -722,12 +737,13 @@ impl Cpu {
                 12
             }
             0x22 => {
-                self.write8_timed(bus, self.hl(), self.a);
+                let hl = self.hl();
+                self.write8_timed_idu(bus, hl, self.a);
                 self.set_hl(self.hl().wrapping_add(1));
                 8
             }
             0x23 => {
-                self.idle(bus);
+                self.idu_timed(bus, self.hl());
                 self.set_hl(self.hl().wrapping_add(1));
                 8
             }
@@ -748,12 +764,13 @@ impl Cpu {
                 8
             }
             0x2a => {
-                self.a = self.read8_timed(bus, self.hl());
+                let hl = self.hl();
+                self.a = self.read8_timed_idu(bus, hl);
                 self.set_hl(self.hl().wrapping_add(1));
                 8
             }
             0x2b => {
-                self.idle(bus);
+                self.idu_timed(bus, self.hl());
                 self.set_hl(self.hl().wrapping_sub(1));
                 8
             }
@@ -775,12 +792,13 @@ impl Cpu {
                 12
             }
             0x32 => {
-                self.write8_timed(bus, self.hl(), self.a);
+                let hl = self.hl();
+                self.write8_timed_idu(bus, hl, self.a);
                 self.set_hl(self.hl().wrapping_sub(1));
                 8
             }
             0x33 => {
-                self.idle(bus);
+                self.idu_timed(bus, self.sp);
                 self.sp = self.sp.wrapping_add(1);
                 8
             }
@@ -804,12 +822,13 @@ impl Cpu {
                 8
             }
             0x3a => {
-                self.a = self.read8_timed(bus, self.hl());
+                let hl = self.hl();
+                self.a = self.read8_timed_idu(bus, hl);
                 self.set_hl(self.hl().wrapping_sub(1));
                 8
             }
             0x3b => {
-                self.idle(bus);
+                self.idu_timed(bus, self.sp);
                 self.sp = self.sp.wrapping_sub(1);
                 8
             }
