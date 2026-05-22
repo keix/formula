@@ -10,10 +10,13 @@ pub struct Mmu {
     ppu: Ppu,
     serial: Serial,
     wram: [u8; 0x2000],
-    oam: [u8; 0xa0],
     io: [u8; 0x80],
     hram: [u8; 0x7f],
     ie: u8,
+    // Last value written to 0xFF46. Reads return this verbatim; writes
+    // also kick off an OAM DMA copy of 160 bytes from (value << 8) to
+    // OAM (0xFE00-0xFE9F).
+    dma: u8,
     // Set when the PPU just entered VBlank (i.e. completed a frame).
     // The display loop consumes this via take_frame_ready().
     frame_ready: bool,
@@ -27,11 +30,24 @@ impl Mmu {
             ppu: Ppu::new(),
             serial: Serial::new(),
             wram: [0; 0x2000],
-            oam: [0; 0xa0],
             io: [0; 0x80],
             hram: [0; 0x7f],
             ie: 0,
+            dma: 0,
             frame_ready: false,
+        }
+    }
+
+    fn start_oam_dma(&mut self, value: u8) {
+        self.dma = value;
+        let base = (value as u16) << 8;
+        // Real hardware bus-blocks the CPU for ~160 M-cycles and only HRAM
+        // stays accessible. We do an instant 160-byte copy; ROMs that rely
+        // on a HRAM bounce-routine still work because read8 below covers
+        // every address space the source value can legally point at.
+        for i in 0..0xa0_u16 {
+            let byte = self.read8(base + i);
+            self.ppu.write_oam(0xfe00 + i, byte);
         }
     }
 
@@ -78,10 +94,11 @@ impl Bus for Mmu {
             0xa000..=0xbfff => self.cartridge.read_ram(addr - 0xa000),
             0xc000..=0xdfff => self.wram[(addr - 0xc000) as usize],
             0xe000..=0xfdff => self.wram[(addr - 0xe000) as usize],
-            0xfe00..=0xfe9f => self.oam[(addr - 0xfe00) as usize],
+            0xfe00..=0xfe9f => self.ppu.read_oam(addr),
             0xfea0..=0xfeff => 0xff,
             0xff01..=0xff02 => self.serial.read(addr),
             0xff04..=0xff07 => self.timer.read(addr),
+            0xff46 => self.dma,
             0xff40..=0xff4b => self.ppu.read(addr),
             0xff00..=0xff7f => self.io[(addr - 0xff00) as usize],
             0xff80..=0xfffe => self.hram[(addr - 0xff80) as usize],
@@ -96,10 +113,11 @@ impl Bus for Mmu {
             0xa000..=0xbfff => self.cartridge.write_ram(addr - 0xa000, value),
             0xc000..=0xdfff => self.wram[(addr - 0xc000) as usize] = value,
             0xe000..=0xfdff => self.wram[(addr - 0xe000) as usize] = value,
-            0xfe00..=0xfe9f => self.oam[(addr - 0xfe00) as usize] = value,
+            0xfe00..=0xfe9f => self.ppu.write_oam(addr, value),
             0xfea0..=0xfeff => {}
             0xff01..=0xff02 => self.serial.write(addr, value),
             0xff04..=0xff07 => self.timer.write(addr, value),
+            0xff46 => self.start_oam_dma(value),
             0xff40..=0xff4b => self.ppu.write(addr, value),
             0xff00..=0xff7f => self.io[(addr - 0xff00) as usize] = value,
             0xff80..=0xfffe => self.hram[(addr - 0xff80) as usize] = value,
@@ -403,6 +421,58 @@ mod tests {
         mmu.tick(8);
 
         assert_eq!(mmu.read8(0xff0f) & 0x02, 0x02);
+    }
+
+    #[test]
+    fn oam_dma_register_reads_back_last_written_value() {
+        let mut mmu = make_mmu();
+        // The value addresses ROM where MBC0 starts as zeros — safe target.
+        mmu.write8(0xff46, 0x00);
+        assert_eq!(mmu.read8(0xff46), 0x00);
+
+        mmu.write8(0xff46, 0xc0);
+        assert_eq!(mmu.read8(0xff46), 0xc0);
+    }
+
+    #[test]
+    fn oam_dma_copies_160_bytes_from_source_into_oam() {
+        let mut mmu = make_mmu();
+        // Seed WRAM at 0xC000..0xC09F with a recognisable pattern.
+        for i in 0..0xa0_u8 {
+            mmu.write8(0xc000 + i as u16, i ^ 0xa5);
+        }
+        // Make sure OAM is empty first.
+        for i in 0..0xa0_u16 {
+            mmu.write8(0xfe00 + i, 0);
+        }
+
+        // Trigger DMA from page 0xC0.
+        mmu.write8(0xff46, 0xc0);
+
+        for i in 0..0xa0_u8 {
+            assert_eq!(
+                mmu.read8(0xfe00 + i as u16),
+                i ^ 0xa5,
+                "OAM byte {i} should have been copied from WRAM"
+            );
+        }
+    }
+
+    #[test]
+    fn oam_dma_can_source_from_vram() {
+        // Verify the DMA loop walks every region the value can legally point
+        // at — VRAM is the most common one for sprite tile bytes.
+        let mut mmu = make_mmu();
+        mmu.write8(0xff40, 0x80); // enable LCD so VRAM is writable in our model
+        for i in 0..0xa0_u8 {
+            mmu.write8(0x8000 + i as u16, i);
+        }
+
+        mmu.write8(0xff46, 0x80);
+
+        for i in 0..0xa0_u8 {
+            assert_eq!(mmu.read8(0xfe00 + i as u16), i);
+        }
     }
 
     #[test]

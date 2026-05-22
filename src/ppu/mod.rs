@@ -22,6 +22,7 @@ pub struct Ppu {
     pub regs: Registers,
     framebuffer: Framebuffer,
     vram: [u8; 0x2000],
+    oam: [u8; 0xa0],
     mode: PpuMode,
     dots: u16,
     // Cached STAT IRQ line. STAT interrupts fire on the LOW->HIGH transition
@@ -37,6 +38,7 @@ impl Ppu {
             regs: Registers::new(),
             framebuffer: Framebuffer::new(),
             vram: [0; 0x2000],
+            oam: [0; 0xa0],
             mode: PpuMode::OamSearch,
             dots: 0,
             stat_line: false,
@@ -57,6 +59,20 @@ impl Ppu {
         }
     }
 
+    pub fn read_oam(&self, addr: u16) -> u8 {
+        match addr {
+            0xfe00..=0xfe9f => self.oam[(addr - 0xfe00) as usize],
+            _ => panic!("PPU: read_oam out of range at {:#06x}", addr),
+        }
+    }
+
+    pub fn write_oam(&mut self, addr: u16, value: u8) {
+        match addr {
+            0xfe00..=0xfe9f => self.oam[(addr - 0xfe00) as usize] = value,
+            _ => panic!("PPU: write_oam out of range at {:#06x}", addr),
+        }
+    }
+
     pub fn mode(&self) -> PpuMode {
         self.mode
     }
@@ -73,7 +89,6 @@ impl Ppu {
             0xff43 => self.regs.scx,
             0xff44 => self.regs.ly,
             0xff45 => self.regs.lyc,
-            0xff46 => self.regs.dma,
             0xff47 => self.regs.bgp,
             0xff48 => self.regs.obp0,
             0xff49 => self.regs.obp1,
@@ -91,9 +106,6 @@ impl Ppu {
             0xff43 => self.regs.scx = value,
             0xff44 => self.regs.ly = 0, // writing to LY resets it (DMG behavior)
             0xff45 => self.regs.lyc = value,
-            // TODO: 0xFF46 should kick off an OAM DMA transfer (160 bytes at the
-            // address value << 8). Stored as a byte for now; transfer comes later.
-            0xff46 => self.regs.dma = value,
             0xff47 => self.regs.bgp = value,
             0xff48 => self.regs.obp0 = value,
             0xff49 => self.regs.obp1 = value,
@@ -568,6 +580,29 @@ mod tests {
     fn vram_write_above_9fff_panics() {
         let mut ppu = Ppu::new();
         ppu.write_vram(0xa000, 0);
+    }
+
+    #[test]
+    fn oam_roundtrips_through_ppu_directly() {
+        let mut ppu = Ppu::new();
+        ppu.write_oam(0xfe00, 0xab);
+        ppu.write_oam(0xfe9f, 0xcd);
+        assert_eq!(ppu.read_oam(0xfe00), 0xab);
+        assert_eq!(ppu.read_oam(0xfe9f), 0xcd);
+    }
+
+    #[test]
+    #[should_panic(expected = "PPU: read_oam out of range")]
+    fn oam_read_below_fe00_panics() {
+        let ppu = Ppu::new();
+        let _ = ppu.read_oam(0xfdff);
+    }
+
+    #[test]
+    #[should_panic(expected = "PPU: write_oam out of range")]
+    fn oam_write_above_fe9f_panics() {
+        let mut ppu = Ppu::new();
+        ppu.write_oam(0xfea0, 0);
     }
 
     // Cycles needed to land on the first HBlank entry (dot 252 of line 0).
