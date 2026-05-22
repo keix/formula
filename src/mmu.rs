@@ -1,5 +1,6 @@
 use crate::bus::Bus;
 use crate::cartridge::Cartridge;
+use crate::joypad::Joypad;
 use crate::ppu::{Framebuffer, Ppu};
 use crate::serial::Serial;
 use crate::timer::Timer;
@@ -9,6 +10,7 @@ pub struct Mmu {
     timer: Timer,
     ppu: Ppu,
     serial: Serial,
+    joypad: Joypad,
     wram: [u8; 0x2000],
     io: [u8; 0x80],
     hram: [u8; 0x7f],
@@ -29,12 +31,22 @@ impl Mmu {
             timer: Timer::new(),
             ppu: Ppu::new(),
             serial: Serial::new(),
+            joypad: Joypad::new(),
             wram: [0; 0x2000],
             io: [0; 0x80],
             hram: [0; 0x7f],
             ie: 0,
             dma: 0,
             frame_ready: false,
+        }
+    }
+
+    /// Push the current set of pressed buttons (a bitmask of joypad::BUTTON_*)
+    /// into the joypad. Raises IF bit 4 if any button just became pressed.
+    pub fn set_buttons(&mut self, pressed: u8) {
+        self.joypad.set_pressed(pressed);
+        if self.joypad.take_interrupt() {
+            self.io[0x0f] |= 0x10; // Joypad -> IF bit 4
         }
     }
 
@@ -87,6 +99,11 @@ impl Mmu {
 }
 
 impl Bus for Mmu {
+    // The IO range 0xFF00-0xFF7F is the catch-all for the generic io[] array;
+    // earlier arms intentionally carve out specific routed sub-addresses
+    // (joypad, serial, timer, ppu, dma). First-match-wins semantics make
+    // this idiomatic, but clippy still flags exact-start overlaps.
+    #[allow(clippy::match_overlapping_arm)]
     fn read8(&self, addr: u16) -> u8 {
         match addr {
             0x0000..=0x7fff => self.cartridge.read_rom(addr),
@@ -96,6 +113,7 @@ impl Bus for Mmu {
             0xe000..=0xfdff => self.wram[(addr - 0xe000) as usize],
             0xfe00..=0xfe9f => self.ppu.read_oam(addr),
             0xfea0..=0xfeff => 0xff,
+            0xff00 => self.joypad.read(addr),
             0xff01..=0xff02 => self.serial.read(addr),
             0xff04..=0xff07 => self.timer.read(addr),
             0xff46 => self.dma,
@@ -106,6 +124,7 @@ impl Bus for Mmu {
         }
     }
 
+    #[allow(clippy::match_overlapping_arm)]
     fn write8(&mut self, addr: u16, value: u8) {
         match addr {
             0x0000..=0x7fff => self.cartridge.write_rom(addr, value),
@@ -115,6 +134,7 @@ impl Bus for Mmu {
             0xe000..=0xfdff => self.wram[(addr - 0xe000) as usize] = value,
             0xfe00..=0xfe9f => self.ppu.write_oam(addr, value),
             0xfea0..=0xfeff => {}
+            0xff00 => self.joypad.write(addr, value),
             0xff01..=0xff02 => self.serial.write(addr, value),
             0xff04..=0xff07 => self.timer.write(addr, value),
             0xff46 => self.start_oam_dma(value),
@@ -292,13 +312,16 @@ mod tests {
 
     #[test]
     fn io_area_roundtrip() {
+        // 0xFF00 (joypad) and 0xFF46 (DMA) bypass the generic io[] array;
+        // they each have dedicated tests above. The other unmapped IO
+        // bytes still round-trip through the array.
         let mut mmu = make_mmu();
 
-        mmu.write8(0xff00, 0xab);
+        mmu.write8(0xff03, 0xab);
         mmu.write8(0xff40, 0x91);
         mmu.write8(0xff7f, 0xcd);
 
-        assert_eq!(mmu.read8(0xff00), 0xab);
+        assert_eq!(mmu.read8(0xff03), 0xab);
         assert_eq!(mmu.read8(0xff40), 0x91);
         assert_eq!(mmu.read8(0xff7f), 0xcd);
     }
@@ -421,6 +444,20 @@ mod tests {
         mmu.tick(8);
 
         assert_eq!(mmu.read8(0xff0f) & 0x02, 0x02);
+    }
+
+    #[test]
+    fn joypad_button_press_routes_to_if_bit_4() {
+        use crate::joypad::BUTTON_A;
+        let mut mmu = make_mmu();
+        mmu.write8(0xff00, 0x10); // P15 = 0 (action row)
+
+        // Press A: a fresh transition latches the Joypad IRQ in IF.
+        mmu.set_buttons(BUTTON_A);
+        assert_eq!(mmu.read8(0xff0f) & 0x10, 0x10);
+
+        // Bit 0 of the joypad register reflects A pressed (active low).
+        assert_eq!(mmu.read8(0xff00) & 0x01, 0);
     }
 
     #[test]

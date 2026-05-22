@@ -1,6 +1,10 @@
 use formula::cartridge::load_cartridge;
 use formula::cpu::Cpu;
 use formula::flags::Flags;
+use formula::joypad::{
+    BUTTON_A, BUTTON_B, BUTTON_DOWN, BUTTON_LEFT, BUTTON_RIGHT, BUTTON_SELECT, BUTTON_START,
+    BUTTON_UP,
+};
 use formula::mmu::Mmu;
 use formula::ppu::{HEIGHT, WIDTH};
 use minifb::{Key, Scale, Window, WindowOptions};
@@ -93,6 +97,7 @@ fn main() -> ExitCode {
         if mmu.take_frame_ready() {
             blit_framebuffer(&mut pixel_buffer, mmu.framebuffer().as_slice());
             let _ = window.update_with_buffer(&pixel_buffer, WIDTH, HEIGHT);
+            mmu.set_buttons(read_joypad(&window));
         }
 
         // Blargg test ROMs (and many homebrew) park themselves in a tight
@@ -114,6 +119,38 @@ fn blit_framebuffer(buffer: &mut [u32], framebuffer: &[u8]) {
     for (dst, &shade) in buffer.iter_mut().zip(framebuffer.iter()) {
         *dst = PALETTE[(shade & 0b11) as usize];
     }
+}
+
+/// Map the host keyboard state onto the GB's eight buttons.
+///
+/// D-pad: arrow keys. A: Z. B: X. Start: Enter. Select: Backspace.
+fn read_joypad(window: &Window) -> u8 {
+    let mut state = 0u8;
+    if window.is_key_down(Key::Up) {
+        state |= BUTTON_UP;
+    }
+    if window.is_key_down(Key::Down) {
+        state |= BUTTON_DOWN;
+    }
+    if window.is_key_down(Key::Left) {
+        state |= BUTTON_LEFT;
+    }
+    if window.is_key_down(Key::Right) {
+        state |= BUTTON_RIGHT;
+    }
+    if window.is_key_down(Key::Z) {
+        state |= BUTTON_A;
+    }
+    if window.is_key_down(Key::X) {
+        state |= BUTTON_B;
+    }
+    if window.is_key_down(Key::Enter) {
+        state |= BUTTON_START;
+    }
+    if window.is_key_down(Key::Backspace) {
+        state |= BUTTON_SELECT;
+    }
+    state
 }
 
 fn post_boot_cpu() -> Cpu {
