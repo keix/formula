@@ -561,6 +561,14 @@ impl Cpu {
                 self.f.set_z(false);
                 4
             }
+            0x10 => {
+                // STOP — encoded as 0x10 0x00. We consume the operand byte
+                // and reset DIV. The low-power / LCD-off semantics aren't
+                // modeled; the CPU keeps executing the next instruction.
+                let _ = self.fetch8(bus);
+                bus.write8(0xff04, 0);
+                4
+            }
             0x11 => {
                 let v = self.fetch16(bus);
                 self.set_de(v);
@@ -923,7 +931,6 @@ impl Cpu {
                 self.locked = true;
                 4
             }
-            _ => panic!("unimplemented opcode: {:#04x}", opcode),
         };
 
         self.tick_ime_delay();
@@ -956,6 +963,22 @@ mod tests {
         cpu.step(&mut mem);
         assert_eq!(cpu.pc, 0x0002);
         assert!(cpu.halted);
+    }
+
+    #[test]
+    fn stop_consumes_operand_and_continues() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        // STOP 0x00, then LD A, 0x42 — the operand byte must not execute.
+        mem.load(0x0000, &[0x10, 0x00, 0x3e, 0x42]);
+
+        cpu.step(&mut mem);
+        assert_eq!(cpu.pc, 0x0002);
+        assert!(!cpu.halted);
+
+        cpu.step(&mut mem);
+        assert_eq!(cpu.a, 0x42);
+        assert_eq!(cpu.pc, 0x0004);
     }
 
     #[test]
@@ -1056,16 +1079,6 @@ mod tests {
         cpu.step(&mut mem);
         assert_eq!(cpu.a, 0x22);
         assert_eq!(cpu.pc, 0x0004);
-    }
-
-    #[test]
-    #[should_panic(expected = "unimplemented opcode")]
-    fn unimplemented_opcode_panics() {
-        let mut cpu = Cpu::new();
-        let mut mem = Memory::new();
-        mem.load(0x0000, &[0x10]); // STOP (not yet implemented)
-
-        cpu.step(&mut mem);
     }
 
     #[test]
