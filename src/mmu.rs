@@ -1,6 +1,6 @@
 use crate::bus::Bus;
 use crate::cartridge::Cartridge;
-use crate::ppu::Ppu;
+use crate::ppu::{Framebuffer, Ppu};
 use crate::serial::Serial;
 use crate::timer::Timer;
 
@@ -14,6 +14,9 @@ pub struct Mmu {
     io: [u8; 0x80],
     hram: [u8; 0x7f],
     ie: u8,
+    // Set when the PPU just entered VBlank (i.e. completed a frame).
+    // The display loop consumes this via take_frame_ready().
+    frame_ready: bool,
 }
 
 impl Mmu {
@@ -28,6 +31,7 @@ impl Mmu {
             io: [0; 0x80],
             hram: [0; 0x7f],
             ie: 0,
+            frame_ready: false,
         }
     }
 
@@ -40,6 +44,9 @@ impl Mmu {
         let ppu_if = self.ppu.tick(u32::from(cycles));
         if ppu_if != 0 {
             self.io[0x0f] |= ppu_if;
+            if ppu_if & 0x01 != 0 {
+                self.frame_ready = true;
+            }
         }
         if self.serial.tick(cycles) {
             self.io[0x0f] |= 0x08; // Serial interrupt -> IF bit 3
@@ -50,6 +57,16 @@ impl Mmu {
     /// since the last call.
     pub fn drain_serial_output(&mut self) -> Vec<u8> {
         self.serial.drain_output()
+    }
+
+    /// Returns true once per frame, when the PPU has just entered VBlank.
+    /// Reading the flag clears it so the next frame can be detected.
+    pub fn take_frame_ready(&mut self) -> bool {
+        std::mem::take(&mut self.frame_ready)
+    }
+
+    pub fn framebuffer(&self) -> &Framebuffer {
+        self.ppu.framebuffer()
     }
 }
 
@@ -403,6 +420,25 @@ mod tests {
         assert_eq!(mmu.read8(0xff0f) & 0x08, 0x08);
 
         assert_eq!(mmu.drain_serial_output(), b"A");
+    }
+
+    #[test]
+    fn take_frame_ready_fires_once_per_vblank_entry() {
+        let mut mmu = make_mmu();
+        mmu.write8(0xff40, 0x80); // enable LCD
+
+        assert!(!mmu.take_frame_ready());
+
+        // Tick through a full pre-VBlank frame.
+        let mut remaining = 144_u32 * 456;
+        while remaining > 0 {
+            let chunk = remaining.min(255) as u8;
+            mmu.tick(chunk);
+            remaining -= u32::from(chunk);
+        }
+
+        assert!(mmu.take_frame_ready(), "frame should be ready at VBlank entry");
+        assert!(!mmu.take_frame_ready(), "the flag is one-shot");
     }
 
     #[test]

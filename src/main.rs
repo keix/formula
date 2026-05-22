@@ -2,6 +2,8 @@ use formula::cartridge::load_cartridge;
 use formula::cpu::Cpu;
 use formula::flags::Flags;
 use formula::mmu::Mmu;
+use formula::ppu::{HEIGHT, WIDTH};
+use minifb::{Key, Scale, Window, WindowOptions};
 use std::env;
 use std::io::Write;
 use std::process::ExitCode;
@@ -10,6 +12,9 @@ use std::process::ExitCode;
 // the terminal. Generous enough for Blargg's cpu_instrs to finish even
 // without the spin-loop terminator below.
 const MAX_CYCLES: u64 = 2_000_000_000;
+
+// DMG-style green palette, lightest -> darkest.
+const PALETTE: [u32; 4] = [0x9bbc0f, 0x8bac0f, 0x306230, 0x0f380f];
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -28,14 +33,52 @@ fn main() -> ExitCode {
 
     let mut mmu = Mmu::new(load_cartridge(rom));
     let mut cpu = post_boot_cpu();
-    // Match the post-boot-ROM hardware state for the bits ROMs actually rely on.
     mmu_write_post_boot_io(&mut mmu);
+
+    // minifb's X11 backend calls XOpenIM, which fails if XMODIFIERS points
+    // at an X input method daemon that isn't reachable (e.g. @im=ibus
+    // inside a Nix shell with no ibus running). We don't take text input,
+    // so suppress IM unconditionally. Safe because main() is still
+    // single-threaded and no other env reader has run.
+    unsafe {
+        std::env::set_var("XMODIFIERS", "@im=none");
+    }
+
+    let mut window = match Window::new(
+        "formula",
+        WIDTH,
+        HEIGHT,
+        WindowOptions {
+            resize: false,
+            scale: Scale::X4,
+            ..WindowOptions::default()
+        },
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("failed to open window: {e:?}");
+            return ExitCode::from(1);
+        }
+    };
+    // Block update_with_buffer to ~60 Hz so the emulator paces itself
+    // close to GB frame rate (one update per VBlank).
+    window.set_target_fps(60);
 
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
+    let mut pixel_buffer: Vec<u32> = vec![0; WIDTH * HEIGHT];
     let mut total_cycles: u64 = 0;
+    let mut parked = false;
 
-    while !cpu.locked && total_cycles < MAX_CYCLES {
+    while window.is_open() && !window.is_key_down(Key::Escape) {
+        if parked || cpu.locked || total_cycles >= MAX_CYCLES {
+            // Hold the last frame visible while the user decides to close.
+            // Re-blitting the cached buffer keeps the fps limiter active so
+            // this loop doesn't spin a core.
+            let _ = window.update_with_buffer(&pixel_buffer, WIDTH, HEIGHT);
+            continue;
+        }
+
         let pre_pc = cpu.pc;
         let cycles = cpu.step(&mut mmu);
         mmu.tick(cycles);
@@ -47,23 +90,29 @@ fn main() -> ExitCode {
             let _ = stdout.flush();
         }
 
+        if mmu.take_frame_ready() {
+            blit_framebuffer(&mut pixel_buffer, mmu.framebuffer().as_slice());
+            let _ = window.update_with_buffer(&pixel_buffer, WIDTH, HEIGHT);
+        }
+
         // Blargg test ROMs (and many homebrew) park themselves in a tight
-        // `JR -2` (or similar) after printing the result. Detect that the
-        // CPU is making no forward progress and exit cleanly instead of
-        // burning cycles to the safety net.
+        // `JR -2` after printing the result. Detect that and switch to
+        // idle mode so the user can see the final frame.
         if !cpu.halted && cpu.pc == pre_pc {
-            let _ = stdout.flush();
-            return ExitCode::SUCCESS;
+            parked = true;
         }
     }
 
     let _ = stdout.flush();
     if cpu.locked {
         eprintln!("\n[CPU locked on illegal opcode at PC={:#06x}]", cpu.pc);
-        ExitCode::from(1)
-    } else {
-        eprintln!("\n[timeout after {total_cycles} cycles]");
-        ExitCode::from(1)
+    }
+    ExitCode::SUCCESS
+}
+
+fn blit_framebuffer(buffer: &mut [u32], framebuffer: &[u8]) {
+    for (dst, &shade) in buffer.iter_mut().zip(framebuffer.iter()) {
+        *dst = PALETTE[(shade & 0b11) as usize];
     }
 }
 
