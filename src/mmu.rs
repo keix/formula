@@ -1,12 +1,14 @@
 use crate::bus::Bus;
 use crate::cartridge::Cartridge;
 use crate::ppu::Ppu;
+use crate::serial::Serial;
 use crate::timer::Timer;
 
 pub struct Mmu {
     cartridge: Box<dyn Cartridge>,
     timer: Timer,
     ppu: Ppu,
+    serial: Serial,
     vram: [u8; 0x2000],
     wram: [u8; 0x2000],
     oam: [u8; 0xa0],
@@ -21,6 +23,7 @@ impl Mmu {
             cartridge,
             timer: Timer::new(),
             ppu: Ppu::new(),
+            serial: Serial::new(),
             vram: [0; 0x2000],
             wram: [0; 0x2000],
             oam: [0; 0xa0],
@@ -40,6 +43,15 @@ impl Mmu {
         if ppu_if != 0 {
             self.io[0x0f] |= ppu_if;
         }
+        if self.serial.tick(cycles) {
+            self.io[0x0f] |= 0x08; // Serial interrupt -> IF bit 3
+        }
+    }
+
+    /// Consume any bytes that the CPU has shipped out via the serial port
+    /// since the last call.
+    pub fn drain_serial_output(&mut self) -> Vec<u8> {
+        self.serial.drain_output()
     }
 }
 
@@ -53,6 +65,7 @@ impl Bus for Mmu {
             0xe000..=0xfdff => self.wram[(addr - 0xe000) as usize],
             0xfe00..=0xfe9f => self.oam[(addr - 0xfe00) as usize],
             0xfea0..=0xfeff => 0xff,
+            0xff01..=0xff02 => self.serial.read(addr),
             0xff04..=0xff07 => self.timer.read(addr),
             0xff40..=0xff4b => self.ppu.read(addr),
             0xff00..=0xff7f => self.io[(addr - 0xff00) as usize],
@@ -70,6 +83,7 @@ impl Bus for Mmu {
             0xe000..=0xfdff => self.wram[(addr - 0xe000) as usize] = value,
             0xfe00..=0xfe9f => self.oam[(addr - 0xfe00) as usize] = value,
             0xfea0..=0xfeff => {}
+            0xff01..=0xff02 => self.serial.write(addr, value),
             0xff04..=0xff07 => self.timer.write(addr, value),
             0xff40..=0xff4b => self.ppu.write(addr, value),
             0xff00..=0xff7f => self.io[(addr - 0xff00) as usize] = value,
@@ -308,6 +322,23 @@ mod tests {
         mmu.tick(8);
 
         assert_eq!(mmu.read8(0xff0f) & 0x02, 0x02);
+    }
+
+    #[test]
+    fn serial_transfer_routes_to_serial_and_raises_if_bit_3() {
+        let mut mmu = make_mmu();
+
+        mmu.write8(0xff01, 0x41); // SB = 'A'
+        mmu.write8(0xff02, 0x81); // SC = transfer start
+
+        // Bit 7 of SC reads as 0 immediately (instant-transfer stub).
+        assert_eq!(mmu.read8(0xff02) & 0x80, 0);
+
+        // Next tick propagates the queued interrupt into IF.
+        mmu.tick(4);
+        assert_eq!(mmu.read8(0xff0f) & 0x08, 0x08);
+
+        assert_eq!(mmu.drain_serial_output(), b"A");
     }
 
     #[test]
