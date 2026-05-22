@@ -43,8 +43,7 @@ fn vblank_jumps_cpu_to_vector_0x40() {
     // Drive until the ISR halts the CPU. Need ~5500 JR iterations
     // (12 cycles each) to cross 65664 PPU dots; 10000 is a safety net.
     for _ in 0..10000 {
-        let cycles = cpu.step(&mut mmu);
-        mmu.tick(cycles);
+        cpu.step(&mut mmu);
         if cpu.halted {
             break;
         }

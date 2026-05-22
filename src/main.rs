@@ -103,7 +103,6 @@ fn main() -> ExitCode {
 
         let pre_pc = cpu.pc;
         let cycles = cpu.step(&mut mmu);
-        mmu.tick(cycles);
         total_cycles += u64::from(cycles);
 
         let out = mmu.drain_serial_output();

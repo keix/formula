@@ -11,4 +11,11 @@ pub trait Bus {
     /// Write one byte to `addr`. Writes to ROM or unmapped regions are
     /// silently dropped; writes to memory-mapped IO have side effects.
     fn write8(&mut self, addr: u16, value: u8);
+    /// Advance the bus-attached subsystems by `cycles` T-cycles.
+    ///
+    /// Flat test memory has no time-based side effects, so the default
+    /// implementation is a no-op.
+    fn tick(&mut self, cycles: u8) {
+        let _ = cycles;
+    }
 }
