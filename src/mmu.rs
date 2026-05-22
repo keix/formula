@@ -297,6 +297,18 @@ mod tests {
     }
 
     #[test]
+    fn stat_interrupt_propagates_to_if_bit_1() {
+        let mut mmu = make_mmu();
+        // Enable LYC source with LYC = LY = 0; first PPU tick raises the line.
+        mmu.write8(0xff45, 0);
+        mmu.write8(0xff41, 0b0100_0000);
+
+        mmu.tick(8);
+
+        assert_eq!(mmu.read8(0xff0f) & 0x02, 0x02);
+    }
+
+    #[test]
     fn vblank_entry_sets_if_bit_0() {
         let mut mmu = make_mmu();
 

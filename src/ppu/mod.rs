@@ -6,11 +6,22 @@ pub use framebuffer::{Framebuffer, HEIGHT, WIDTH};
 pub use mode::PpuMode;
 pub use registers::Registers;
 
+// STAT interrupt source enable bits (within the STAT register).
+const STAT_INT_LYC: u8 = 1 << 6;
+const STAT_INT_OAM: u8 = 1 << 5;
+const STAT_INT_VBLANK: u8 = 1 << 4;
+const STAT_INT_HBLANK: u8 = 1 << 3;
+
 pub struct Ppu {
     pub regs: Registers,
     framebuffer: Framebuffer,
     mode: PpuMode,
     dots: u16,
+    // Cached STAT IRQ line. STAT interrupts fire on the LOW->HIGH transition
+    // of any enabled source. Holding the previous level lets us detect that
+    // rising edge and avoids spurious refires while the condition persists
+    // (the hardware "STAT IRQ blocking" behavior).
+    stat_line: bool,
 }
 
 impl Ppu {
@@ -20,6 +31,7 @@ impl Ppu {
             framebuffer: Framebuffer::new(),
             mode: PpuMode::OamSearch,
             dots: 0,
+            stat_line: false,
         }
     }
 
@@ -84,6 +96,19 @@ impl Ppu {
         self.regs.stat_select = value & 0b0111_1000;
     }
 
+    fn compute_stat_line(&self) -> bool {
+        let s = self.regs.stat_select;
+        if (s & STAT_INT_LYC) != 0 && self.regs.ly == self.regs.lyc {
+            return true;
+        }
+        match self.mode {
+            PpuMode::HBlank => (s & STAT_INT_HBLANK) != 0,
+            PpuMode::VBlank => (s & STAT_INT_VBLANK) != 0,
+            PpuMode::OamSearch => (s & STAT_INT_OAM) != 0,
+            PpuMode::Drawing => false,
+        }
+    }
+
     /// Advance the PPU by `cycles` dots and return any IF bits to set.
     pub fn tick(&mut self, cycles: u32) -> u8 {
         let mut interrupts = 0;
@@ -108,6 +133,14 @@ impl Ppu {
             } else {
                 PpuMode::HBlank
             };
+
+            // STAT IRQ line: rising edge raises IF bit 1 once; subsequent
+            // cycles with the line still high do not refire.
+            let new_line = self.compute_stat_line();
+            if !self.stat_line && new_line {
+                interrupts |= 0x02; // LCD STAT -> IF bit 1
+            }
+            self.stat_line = new_line;
         }
         interrupts
     }
@@ -233,5 +266,97 @@ mod tests {
 
         ppu.write(0xff44, 42);
         assert_eq!(ppu.regs.ly, 0);
+    }
+
+    #[test]
+    fn stat_interrupt_fires_on_oam_search_entry() {
+        let mut ppu = Ppu::new();
+        // Initial mode is OAM Search; line is LOW until source is enabled.
+        ppu.write(0xff41, STAT_INT_OAM);
+        // First tick raises the line LOW -> HIGH.
+        assert_eq!(ppu.tick(1) & 0x02, 0x02);
+    }
+
+    #[test]
+    fn stat_interrupt_fires_on_hblank_entry() {
+        let mut ppu = Ppu::new();
+        ppu.write(0xff41, STAT_INT_HBLANK);
+
+        // No HBlank source matched yet (we are still in OAM/Drawing)
+        assert_eq!(ppu.tick(251) & 0x02, 0);
+        // Dot 252 enters HBlank
+        assert_eq!(ppu.tick(1) & 0x02, 0x02);
+    }
+
+    #[test]
+    fn stat_interrupt_fires_on_vblank_entry_alongside_vblank_if() {
+        let mut ppu = Ppu::new();
+        ppu.write(0xff41, STAT_INT_VBLANK);
+
+        let mut total = 0_u8;
+        for _ in 0..(456 * 144) {
+            total |= ppu.tick(1);
+        }
+        assert_eq!(total & 0x02, 0x02, "STAT interrupt should fire");
+        assert_eq!(total & 0x01, 0x01, "VBlank IF bit should also fire");
+    }
+
+    #[test]
+    fn stat_interrupt_fires_on_lyc_match() {
+        let mut ppu = Ppu::new();
+        ppu.write(0xff45, 5); // LYC = 5
+        ppu.write(0xff41, STAT_INT_LYC);
+
+        let mut total = 0_u8;
+        for _ in 0..(456 * 5) {
+            total |= ppu.tick(1);
+        }
+        assert_eq!(total & 0x02, 0x02);
+    }
+
+    #[test]
+    fn stat_interrupt_does_not_fire_when_sources_disabled() {
+        let mut ppu = Ppu::new();
+        // No STAT sources enabled
+        let mut total = 0_u8;
+        for _ in 0..(456 * 144) {
+            total |= ppu.tick(1);
+        }
+        assert_eq!(total & 0x02, 0, "STAT must stay quiet");
+        assert_eq!(total & 0x01, 0x01, "but VBlank IF still fires independently");
+    }
+
+    #[test]
+    fn stat_interrupt_does_not_refire_while_line_stays_high() {
+        let mut ppu = Ppu::new();
+        ppu.write(0xff41, STAT_INT_OAM);
+
+        // First cycle fires
+        assert_eq!(ppu.tick(1) & 0x02, 0x02);
+
+        // Remaining OAM Search cycles (dots 2..80) do not refire
+        let mut total = 0_u8;
+        for _ in 0..78 {
+            total |= ppu.tick(1);
+        }
+        assert_eq!(total & 0x02, 0);
+    }
+
+    #[test]
+    fn overlapping_stat_sources_fire_only_once_per_rising_edge() {
+        let mut ppu = Ppu::new();
+        ppu.write(0xff45, 0); // LYC = LY = 0, so LYC source is true from the start
+        ppu.write(0xff41, STAT_INT_LYC | STAT_INT_OAM);
+
+        // Line was LOW, both conditions are now true: single rising edge -> 1 fire.
+        assert_eq!(ppu.tick(1) & 0x02, 0x02);
+
+        // Through the rest of line 0's OAM Search: line stays HIGH (LYC or OAM),
+        // no refire.
+        let mut total = 0_u8;
+        for _ in 0..78 {
+            total |= ppu.tick(1);
+        }
+        assert_eq!(total & 0x02, 0);
     }
 }
