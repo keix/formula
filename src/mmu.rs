@@ -1,6 +1,7 @@
 use crate::bus::Bus;
 use crate::cartridge::Cartridge;
-use crate::ppu::Ppu;
+use crate::joypad::Joypad;
+use crate::ppu::{Framebuffer, Ppu};
 use crate::serial::Serial;
 use crate::timer::Timer;
 
@@ -9,11 +10,18 @@ pub struct Mmu {
     timer: Timer,
     ppu: Ppu,
     serial: Serial,
+    joypad: Joypad,
     wram: [u8; 0x2000],
-    oam: [u8; 0xa0],
     io: [u8; 0x80],
     hram: [u8; 0x7f],
     ie: u8,
+    // Last value written to 0xFF46. Reads return this verbatim; writes
+    // also kick off an OAM DMA copy of 160 bytes from (value << 8) to
+    // OAM (0xFE00-0xFE9F).
+    dma: u8,
+    // Set when the PPU just entered VBlank (i.e. completed a frame).
+    // The display loop consumes this via take_frame_ready().
+    frame_ready: bool,
 }
 
 impl Mmu {
@@ -23,11 +31,35 @@ impl Mmu {
             timer: Timer::new(),
             ppu: Ppu::new(),
             serial: Serial::new(),
+            joypad: Joypad::new(),
             wram: [0; 0x2000],
-            oam: [0; 0xa0],
             io: [0; 0x80],
             hram: [0; 0x7f],
             ie: 0,
+            dma: 0,
+            frame_ready: false,
+        }
+    }
+
+    /// Push the current set of pressed buttons (a bitmask of joypad::BUTTON_*)
+    /// into the joypad. Raises IF bit 4 if any button just became pressed.
+    pub fn set_buttons(&mut self, pressed: u8) {
+        self.joypad.set_pressed(pressed);
+        if self.joypad.take_interrupt() {
+            self.io[0x0f] |= 0x10; // Joypad -> IF bit 4
+        }
+    }
+
+    fn start_oam_dma(&mut self, value: u8) {
+        self.dma = value;
+        let base = (value as u16) << 8;
+        // Real hardware bus-blocks the CPU for ~160 M-cycles and only HRAM
+        // stays accessible. We do an instant 160-byte copy; ROMs that rely
+        // on a HRAM bounce-routine still work because read8 below covers
+        // every address space the source value can legally point at.
+        for i in 0..0xa0_u16 {
+            let byte = self.read8(base + i);
+            self.ppu.write_oam(0xfe00 + i, byte);
         }
     }
 
@@ -40,6 +72,9 @@ impl Mmu {
         let ppu_if = self.ppu.tick(u32::from(cycles));
         if ppu_if != 0 {
             self.io[0x0f] |= ppu_if;
+            if ppu_if & 0x01 != 0 {
+                self.frame_ready = true;
+            }
         }
         if self.serial.tick(cycles) {
             self.io[0x0f] |= 0x08; // Serial interrupt -> IF bit 3
@@ -51,9 +86,24 @@ impl Mmu {
     pub fn drain_serial_output(&mut self) -> Vec<u8> {
         self.serial.drain_output()
     }
+
+    /// Returns true once per frame, when the PPU has just entered VBlank.
+    /// Reading the flag clears it so the next frame can be detected.
+    pub fn take_frame_ready(&mut self) -> bool {
+        std::mem::take(&mut self.frame_ready)
+    }
+
+    pub fn framebuffer(&self) -> &Framebuffer {
+        self.ppu.framebuffer()
+    }
 }
 
 impl Bus for Mmu {
+    // The IO range 0xFF00-0xFF7F is the catch-all for the generic io[] array;
+    // earlier arms intentionally carve out specific routed sub-addresses
+    // (joypad, serial, timer, ppu, dma). First-match-wins semantics make
+    // this idiomatic, but clippy still flags exact-start overlaps.
+    #[allow(clippy::match_overlapping_arm)]
     fn read8(&self, addr: u16) -> u8 {
         match addr {
             0x0000..=0x7fff => self.cartridge.read_rom(addr),
@@ -61,10 +111,12 @@ impl Bus for Mmu {
             0xa000..=0xbfff => self.cartridge.read_ram(addr - 0xa000),
             0xc000..=0xdfff => self.wram[(addr - 0xc000) as usize],
             0xe000..=0xfdff => self.wram[(addr - 0xe000) as usize],
-            0xfe00..=0xfe9f => self.oam[(addr - 0xfe00) as usize],
+            0xfe00..=0xfe9f => self.ppu.read_oam(addr),
             0xfea0..=0xfeff => 0xff,
+            0xff00 => self.joypad.read(addr),
             0xff01..=0xff02 => self.serial.read(addr),
             0xff04..=0xff07 => self.timer.read(addr),
+            0xff46 => self.dma,
             0xff40..=0xff4b => self.ppu.read(addr),
             0xff00..=0xff7f => self.io[(addr - 0xff00) as usize],
             0xff80..=0xfffe => self.hram[(addr - 0xff80) as usize],
@@ -72,6 +124,7 @@ impl Bus for Mmu {
         }
     }
 
+    #[allow(clippy::match_overlapping_arm)]
     fn write8(&mut self, addr: u16, value: u8) {
         match addr {
             0x0000..=0x7fff => self.cartridge.write_rom(addr, value),
@@ -79,10 +132,12 @@ impl Bus for Mmu {
             0xa000..=0xbfff => self.cartridge.write_ram(addr - 0xa000, value),
             0xc000..=0xdfff => self.wram[(addr - 0xc000) as usize] = value,
             0xe000..=0xfdff => self.wram[(addr - 0xe000) as usize] = value,
-            0xfe00..=0xfe9f => self.oam[(addr - 0xfe00) as usize] = value,
+            0xfe00..=0xfe9f => self.ppu.write_oam(addr, value),
             0xfea0..=0xfeff => {}
+            0xff00 => self.joypad.write(addr, value),
             0xff01..=0xff02 => self.serial.write(addr, value),
             0xff04..=0xff07 => self.timer.write(addr, value),
+            0xff46 => self.start_oam_dma(value),
             0xff40..=0xff4b => self.ppu.write(addr, value),
             0xff00..=0xff7f => self.io[(addr - 0xff00) as usize] = value,
             0xff80..=0xfffe => self.hram[(addr - 0xff80) as usize] = value,
@@ -257,13 +312,16 @@ mod tests {
 
     #[test]
     fn io_area_roundtrip() {
+        // 0xFF00 (joypad) and 0xFF46 (DMA) bypass the generic io[] array;
+        // they each have dedicated tests above. The other unmapped IO
+        // bytes still round-trip through the array.
         let mut mmu = make_mmu();
 
-        mmu.write8(0xff00, 0xab);
+        mmu.write8(0xff03, 0xab);
         mmu.write8(0xff40, 0x91);
         mmu.write8(0xff7f, 0xcd);
 
-        assert_eq!(mmu.read8(0xff00), 0xab);
+        assert_eq!(mmu.read8(0xff03), 0xab);
         assert_eq!(mmu.read8(0xff40), 0x91);
         assert_eq!(mmu.read8(0xff7f), 0xcd);
     }
@@ -389,6 +447,72 @@ mod tests {
     }
 
     #[test]
+    fn joypad_button_press_routes_to_if_bit_4() {
+        use crate::joypad::BUTTON_A;
+        let mut mmu = make_mmu();
+        mmu.write8(0xff00, 0x10); // P15 = 0 (action row)
+
+        // Press A: a fresh transition latches the Joypad IRQ in IF.
+        mmu.set_buttons(BUTTON_A);
+        assert_eq!(mmu.read8(0xff0f) & 0x10, 0x10);
+
+        // Bit 0 of the joypad register reflects A pressed (active low).
+        assert_eq!(mmu.read8(0xff00) & 0x01, 0);
+    }
+
+    #[test]
+    fn oam_dma_register_reads_back_last_written_value() {
+        let mut mmu = make_mmu();
+        // The value addresses ROM where MBC0 starts as zeros — safe target.
+        mmu.write8(0xff46, 0x00);
+        assert_eq!(mmu.read8(0xff46), 0x00);
+
+        mmu.write8(0xff46, 0xc0);
+        assert_eq!(mmu.read8(0xff46), 0xc0);
+    }
+
+    #[test]
+    fn oam_dma_copies_160_bytes_from_source_into_oam() {
+        let mut mmu = make_mmu();
+        // Seed WRAM at 0xC000..0xC09F with a recognisable pattern.
+        for i in 0..0xa0_u8 {
+            mmu.write8(0xc000 + i as u16, i ^ 0xa5);
+        }
+        // Make sure OAM is empty first.
+        for i in 0..0xa0_u16 {
+            mmu.write8(0xfe00 + i, 0);
+        }
+
+        // Trigger DMA from page 0xC0.
+        mmu.write8(0xff46, 0xc0);
+
+        for i in 0..0xa0_u8 {
+            assert_eq!(
+                mmu.read8(0xfe00 + i as u16),
+                i ^ 0xa5,
+                "OAM byte {i} should have been copied from WRAM"
+            );
+        }
+    }
+
+    #[test]
+    fn oam_dma_can_source_from_vram() {
+        // Verify the DMA loop walks every region the value can legally point
+        // at — VRAM is the most common one for sprite tile bytes.
+        let mut mmu = make_mmu();
+        mmu.write8(0xff40, 0x80); // enable LCD so VRAM is writable in our model
+        for i in 0..0xa0_u8 {
+            mmu.write8(0x8000 + i as u16, i);
+        }
+
+        mmu.write8(0xff46, 0x80);
+
+        for i in 0..0xa0_u8 {
+            assert_eq!(mmu.read8(0xfe00 + i as u16), i);
+        }
+    }
+
+    #[test]
     fn serial_transfer_routes_to_serial_and_raises_if_bit_3() {
         let mut mmu = make_mmu();
 
@@ -403,6 +527,25 @@ mod tests {
         assert_eq!(mmu.read8(0xff0f) & 0x08, 0x08);
 
         assert_eq!(mmu.drain_serial_output(), b"A");
+    }
+
+    #[test]
+    fn take_frame_ready_fires_once_per_vblank_entry() {
+        let mut mmu = make_mmu();
+        mmu.write8(0xff40, 0x80); // enable LCD
+
+        assert!(!mmu.take_frame_ready());
+
+        // Tick through a full pre-VBlank frame.
+        let mut remaining = 144_u32 * 456;
+        while remaining > 0 {
+            let chunk = remaining.min(255) as u8;
+            mmu.tick(chunk);
+            remaining -= u32::from(chunk);
+        }
+
+        assert!(mmu.take_frame_ready(), "frame should be ready at VBlank entry");
+        assert!(!mmu.take_frame_ready(), "the flag is one-shot");
     }
 
     #[test]

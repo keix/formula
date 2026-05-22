@@ -2,6 +2,7 @@ pub mod bus;
 pub mod cartridge;
 pub mod cpu;
 pub mod flags;
+pub mod joypad;
 pub mod memory;
 pub mod mmu;
 pub mod ppu;

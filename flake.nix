@@ -13,6 +13,16 @@
   ] (system:
     let
       pkgs = import nixpkgs { inherit system; };
+      # minifb dlopens these at runtime on Linux for the X11 / Wayland
+      # backends; on Darwin it uses Cocoa via the SDK and needs nothing.
+      linuxDisplayLibs = with pkgs; [
+        libxkbcommon
+        wayland
+        libx11
+        libxcursor
+        libxi
+        libxrandr
+      ];
     in
     {
       devShells.default = pkgs.mkShell {
@@ -23,6 +33,9 @@
           clippy
           rust-analyzer
         ];
+        buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux linuxDisplayLibs;
+        LD_LIBRARY_PATH = pkgs.lib.optionalString pkgs.stdenv.isLinux
+          (pkgs.lib.makeLibraryPath linuxDisplayLibs);
       };
     }
   );
