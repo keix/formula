@@ -27,11 +27,6 @@ pub trait Bus {
         let _ = idu_addr;
         self.read8_cpu(addr)
     }
-    /// CPU read in an M-cycle where `POP` also glitches the bus via the IDU.
-    /// On DMG this behaves differently from a generic read+IDU sequence.
-    fn read8_cpu_pop(&mut self, addr: u16, idu_addr: u16) -> u8 {
-        self.read8_cpu_idu(addr, idu_addr)
-    }
     /// CPU write in an M-cycle that also performs a 16-bit inc/dec on the
     /// same register pair (`LD [HLI],A`, `LD [HLD],A`).
     fn write8_cpu_idu(&mut self, addr: u16, value: u8, idu_addr: u16) {

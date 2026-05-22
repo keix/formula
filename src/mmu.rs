@@ -46,7 +46,6 @@ pub struct Mmu {
     // If the most recent CPU M-cycle overlapped a single mode-2 OAM scan row,
     // cache that row so the following CPU access can apply the DMG OAM bug.
     last_oam_bug_row: Option<usize>,
-    last_oam_bug_row_before_tick: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -73,7 +72,6 @@ impl Mmu {
             dma: 0,
             frame_ready: false,
             last_oam_bug_row: None,
-            last_oam_bug_row_before_tick: None,
         }
     }
 
@@ -132,34 +130,70 @@ impl Mmu {
     }
 
     fn apply_oam_read_corruption(&mut self, row: usize) {
+        // Mirrors SameBoy's GB_trigger_oam_bug_read: the corruption pattern
+        // depends on the byte offset of the currently scanned OAM row, and
+        // the outer "copy previous row over current row" applies in every
+        // branch. byte_offset = row * 8 in our row-index model.
         if row == 0 {
             return;
         }
 
-        let a = self.oam_word(row, 0);
-        let b = self.oam_word(row - 1, 0);
-        let c = self.oam_word(row - 1, 2);
-        self.set_oam_word(row, 0, b | (a & c));
-        for word in 1..4 {
-            self.set_oam_word(row, word, self.oam_word(row - 1, word));
+        match row & 0x3 {
+            // byte & 0x18 == 0x10: secondary read corruption (four-input
+            // glitch that uses prev-row word 2 in addition to a/b/c).
+            2 => {
+                if row >= 2 {
+                    let a = self.oam_word(row - 2, 0);
+                    let b = self.oam_word(row - 1, 0);
+                    let c = self.oam_word(row, 0);
+                    let d = self.oam_word(row - 1, 2);
+                    self.set_oam_word(row - 1, 0, (b & (a | c | d)) | (a & c & d));
+                    // Inner copy: previous row replicates over (row-2).
+                    for word in 0..4 {
+                        let v = self.oam_word(row - 1, word);
+                        self.set_oam_word(row - 2, word, v);
+                    }
+                }
+            }
+            // byte & 0x18 == 0x00: tertiary / quaternary, deeply model-
+            // and row-specific. Fall through to the simple pattern for
+            // the rows the current Blargg tests don't hit; revisit when
+            // we tackle the row 0x20 / 0x40 / 0x60 / 0x80 corner cases.
+            0 | 1 | 3 => {
+                let a = self.oam_word(row, 0);
+                let b = self.oam_word(row - 1, 0);
+                let c = self.oam_word(row - 1, 2);
+                let result = b | (a & c);
+                self.set_oam_word(row, 0, result);
+                self.set_oam_word(row - 1, 0, result);
+            }
+            _ => unreachable!(),
+        }
+
+        // Outer copy: previous row replicates over the current row entirely
+        // (this is what causes the corruption to cascade across the three
+        // adjacent rows the bug touches).
+        for word in 0..4 {
+            let v = self.oam_word(row - 1, word);
+            self.set_oam_word(row, word, v);
         }
     }
 
     fn apply_oam_read_idu_corruption(&mut self, row: usize) {
         if (4..19).contains(&row) {
+            // Standard GBDev formula uses only a, b, c. The IDU formula is
+            // the *whole* corruption for a read+IDU access — real hardware
+            // does not also fire the plain-read pattern on the same M-cycle.
             let a = self.oam_word(row - 2, 0);
             let b = self.oam_word(row - 1, 0);
             let c = self.oam_word(row, 0);
-            let d = self.oam_word(row - 1, 2);
-            self.set_oam_word(row - 1, 0, (b & (a | c | d)) | (a & c & d));
+            self.set_oam_word(row - 1, 0, (b & (a | c)) | (a & c));
             for word in 1..4 {
                 let prev = self.oam_word(row - 1, word);
                 self.set_oam_word(row, word, prev);
                 self.set_oam_word(row - 2, word, prev);
             }
         }
-
-        self.apply_oam_read_corruption(row);
     }
 
     fn maybe_apply_oam_bug(&mut self, addr: u16, kind: OamBugKind) {
@@ -182,7 +216,6 @@ impl Mmu {
     /// Advance memory-mapped sub-systems by `cycles` T-cycles. Subsystems
     /// that raise interrupts set the corresponding bit in IF (0xFF0F).
     pub fn tick(&mut self, cycles: u8) {
-        self.last_oam_bug_row_before_tick = self.ppu.oam_bug_row_for_access();
         if self.timer.tick(cycles) {
             self.io[0x0f] |= 0x04; // Timer interrupt -> IF bit 2
         }
@@ -287,17 +320,6 @@ impl Bus for Mmu {
     fn read8_cpu_idu(&mut self, addr: u16, idu_addr: u16) -> u8 {
         let value = self.read8(addr);
         self.maybe_apply_oam_bug(idu_addr, OamBugKind::ReadIdu);
-        value
-    }
-
-    fn read8_cpu_pop(&mut self, addr: u16, idu_addr: u16) -> u8 {
-        let value = self.read8(addr);
-        if (0xfe00..=0xfeff).contains(&idu_addr) {
-            if let Some(row) = self.last_oam_bug_row_before_tick {
-                self.apply_oam_write_corruption(row);
-            }
-        }
-        self.maybe_apply_oam_bug(addr, OamBugKind::Read);
         value
     }
 

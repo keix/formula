@@ -119,11 +119,6 @@ impl Cpu {
         bus.read8_cpu_idu(addr, idu_addr)
     }
 
-    fn read8_timed_pop(&mut self, bus: &mut impl Bus, addr: u16, idu_addr: u16) -> u8 {
-        self.mcycle(bus);
-        bus.read8_cpu_pop(addr, idu_addr)
-    }
-
     fn write8_timed_idu(&mut self, bus: &mut impl Bus, addr: u16, value: u8, idu_addr: u16) {
         self.mcycle(bus);
         bus.write8_cpu_idu(addr, value, idu_addr);
@@ -167,9 +162,13 @@ impl Cpu {
     }
 
     fn pop16(&mut self, bus: &mut impl Bus) -> u16 {
+        // POP rp triggers only the read-side OAM bug (the dispatcher in
+        // Mmu::apply_oam_read_corruption picks the right pattern per row).
+        // The IDU bus stays quiet during POP's reads — matching SameBoy's
+        // `pop_rr` which only emits cycle_read calls.
         let lo = self.read8_timed(bus, self.sp);
         self.sp = self.sp.wrapping_add(1);
-        let hi = self.read8_timed_pop(bus, self.sp, self.sp);
+        let hi = self.read8_timed(bus, self.sp);
         self.sp = self.sp.wrapping_add(1);
         u16::from_be_bytes([hi, lo])
     }
