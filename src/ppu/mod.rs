@@ -14,8 +14,10 @@ const STAT_INT_HBLANK: u8 = 1 << 3;
 
 // LCDC register bits.
 const LCDC_LCD_ENABLE: u8 = 1 << 7;
-const LCDC_BG_TILE_MAP: u8 = 1 << 3; // 0 = 0x9800-0x9BFF, 1 = 0x9C00-0x9FFF
+const LCDC_WINDOW_TILE_MAP: u8 = 1 << 6; // 0 = 0x9800-0x9BFF, 1 = 0x9C00-0x9FFF
+const LCDC_WINDOW_ENABLE: u8 = 1 << 5;
 const LCDC_TILE_DATA: u8 = 1 << 4; // 0 = signed (base 0x9000), 1 = unsigned (base 0x8000)
+const LCDC_BG_TILE_MAP: u8 = 1 << 3; // 0 = 0x9800-0x9BFF, 1 = 0x9C00-0x9FFF
 const LCDC_BG_ENABLE: u8 = 1 << 0;
 
 pub struct Ppu {
@@ -30,6 +32,10 @@ pub struct Ppu {
     // rising edge and avoids spurious refires while the condition persists
     // (the hardware "STAT IRQ blocking" behavior).
     stat_line: bool,
+    // Window's internal line counter. Advances only on scanlines where the
+    // window is actually drawn; resets at the start of every frame and when
+    // the LCD turns off.
+    wly: u8,
 }
 
 impl Ppu {
@@ -42,6 +48,7 @@ impl Ppu {
             mode: PpuMode::OamSearch,
             dots: 0,
             stat_line: false,
+            wly: 0,
         }
     }
 
@@ -142,6 +149,7 @@ impl Ppu {
             self.dots = 0;
             self.mode = PpuMode::HBlank;
             self.stat_line = false;
+            self.wly = 0;
         }
     }
 
@@ -171,6 +179,8 @@ impl Ppu {
                 self.regs.ly += 1;
                 if self.regs.ly == 154 {
                     self.regs.ly = 0;
+                    // Window line counter restarts at the top of every frame.
+                    self.wly = 0;
                 }
                 if self.regs.ly == 144 {
                     interrupts |= 0x01; // VBlank -> IF bit 0
@@ -191,6 +201,9 @@ impl Ppu {
             // the whole line in one shot at the transition.
             if self.dots == 80 + 172 && self.regs.ly < 144 {
                 self.render_bg_scanline();
+                if self.render_window_scanline() {
+                    self.wly = self.wly.wrapping_add(1);
+                }
             }
 
             // STAT IRQ line: rising edge raises IF bit 1 once; subsequent
@@ -250,6 +263,68 @@ impl Ppu {
 
             self.framebuffer.set_pixel(x, ly, shade);
         }
+    }
+
+    /// Overlay the Window layer on top of the current scanline. Returns true
+    /// if any pixel was drawn (the window's internal line counter advances
+    /// only on rendered scanlines).
+    fn render_window_scanline(&mut self) -> bool {
+        // On DMG the master "BG/Win enable" gate also kills the window.
+        if (self.regs.lcdc & LCDC_BG_ENABLE) == 0 {
+            return false;
+        }
+        if (self.regs.lcdc & LCDC_WINDOW_ENABLE) == 0 {
+            return false;
+        }
+        if self.regs.ly < self.regs.wy {
+            return false;
+        }
+        // WX is "window X + 7"; values >=167 push the window off-screen.
+        if self.regs.wx >= 167 {
+            return false;
+        }
+
+        let map_base: u16 = if (self.regs.lcdc & LCDC_WINDOW_TILE_MAP) != 0 {
+            0x9c00
+        } else {
+            0x9800
+        };
+        let unsigned_tile_data = (self.regs.lcdc & LCDC_TILE_DATA) != 0;
+        let bgp = self.regs.bgp;
+        let ly = self.regs.ly as usize;
+
+        let tile_row = (self.wly / 8) as u16;
+        let fine_y = (self.wly % 8) as u16;
+
+        let wx_minus_7 = self.regs.wx as i32 - 7;
+        let mut drew_anything = false;
+        for x in 0..WIDTH {
+            let window_col = x as i32 - wx_minus_7;
+            if window_col < 0 {
+                continue;
+            }
+            let window_col = window_col as u16;
+            let tile_col = window_col / 8;
+            let fine_x = (window_col % 8) as u8;
+
+            let tile_index = self.read_vram(map_base + tile_row * 32 + tile_col);
+            let tile_data_addr = if unsigned_tile_data {
+                0x8000 + (tile_index as u16) * 16
+            } else {
+                (0x9000_i32 + (tile_index as i8 as i32) * 16) as u16
+            };
+
+            let lo = self.read_vram(tile_data_addr + fine_y * 2);
+            let hi = self.read_vram(tile_data_addr + fine_y * 2 + 1);
+
+            let bit = 7 - fine_x;
+            let color_index = (((hi >> bit) & 1) << 1) | ((lo >> bit) & 1);
+            let shade = (bgp >> (color_index * 2)) & 0b11;
+
+            self.framebuffer.set_pixel(x, ly, shade);
+            drew_anything = true;
+        }
+        drew_anything
     }
 }
 
@@ -848,6 +923,150 @@ mod tests {
         ppu.tick(456 - TO_HBLANK + TO_HBLANK);
         assert_eq!(ppu.framebuffer().pixel(0, 0), 3, "line 0 sticks at its rendered shade");
         assert_eq!(ppu.framebuffer().pixel(0, 1), 0, "line 1 picks the new BGP mapping");
+    }
+
+    // ----- Window layer -----
+
+    fn ppu_with_bg_and_window() -> Ppu {
+        // LCD on, BG on, window on, unsigned tile data, window map at $9C00.
+        let mut ppu = Ppu::new();
+        ppu.write(0xff40, LCDC_LCD_ENABLE | LCDC_BG_ENABLE | LCDC_WINDOW_ENABLE
+            | LCDC_TILE_DATA | LCDC_WINDOW_TILE_MAP);
+        ppu.write(0xff47, 0xe4); // identity BGP
+        // BG tile 0 -> color 1 (so the window's color 3 stands out on top).
+        for offset in 0..16 {
+            ppu.write_vram(0x8000 + offset, if offset % 2 == 0 { 0xff } else { 0x00 });
+        }
+        // Window tile 1 -> color 3 (solid).
+        for offset in 0..16 {
+            ppu.write_vram(0x8010 + offset, 0xff);
+        }
+        // Window map at $9C00 picks tile 1 for every cell.
+        for cell in 0x9c00_u16..=0x9fff {
+            ppu.write_vram(cell, 1);
+        }
+        ppu
+    }
+
+    #[test]
+    fn window_overlays_bg_when_enabled_and_visible() {
+        let mut ppu = ppu_with_bg_and_window();
+        ppu.write(0xff4a, 0); // WY = 0
+        ppu.write(0xff4b, 7); // WX - 7 = 0 -> window from screen x = 0
+        ppu.tick(TO_HBLANK);
+        // Every pixel of line 0 is the window's color 3 pixel.
+        assert_eq!(ppu.framebuffer().pixel(0, 0), 3);
+        assert_eq!(ppu.framebuffer().pixel(WIDTH - 1, 0), 3);
+    }
+
+    #[test]
+    fn window_is_clipped_below_wy() {
+        let mut ppu = ppu_with_bg_and_window();
+        ppu.write(0xff4a, 5); // WY = 5
+        ppu.write(0xff4b, 7);
+
+        // Run to HBlank entry of line 4 (last pre-WY line).
+        ppu.tick(TO_HBLANK + 456 * 4);
+        for line in 0..=4 {
+            assert_eq!(ppu.framebuffer().pixel(0, line), 1, "line {line} (BG only)");
+        }
+        // One more line: LY=5 now satisfies LY >= WY -> window draws over BG.
+        ppu.tick(456);
+        assert_eq!(ppu.framebuffer().pixel(0, 5), 3);
+    }
+
+    #[test]
+    fn window_at_wx_above_166_is_invisible() {
+        let mut ppu = ppu_with_bg_and_window();
+        ppu.write(0xff4a, 0);
+        ppu.write(0xff4b, 167); // off-screen right
+        ppu.tick(TO_HBLANK);
+        // No window drawn -> BG's color 1 shows through everywhere.
+        assert_eq!(ppu.framebuffer().pixel(0, 0), 1);
+        assert_eq!(ppu.framebuffer().pixel(WIDTH - 1, 0), 1);
+    }
+
+    #[test]
+    fn window_with_wx_below_seven_clips_left_edge() {
+        let mut ppu = ppu_with_bg_and_window();
+        ppu.write(0xff4a, 0);
+        ppu.write(0xff4b, 3); // wx - 7 = -4: window pushed off-screen by 4
+        ppu.tick(TO_HBLANK);
+        // Whole visible line is still the window (we just lose the first 4
+        // window columns to clipping). Window tile is solid color 3.
+        for x in 0..WIDTH {
+            assert_eq!(ppu.framebuffer().pixel(x, 0), 3, "x={x}");
+        }
+    }
+
+    #[test]
+    fn window_does_not_render_when_lcdc_window_enable_is_clear() {
+        let mut ppu = ppu_with_bg_and_window();
+        ppu.write(0xff40, LCDC_LCD_ENABLE | LCDC_BG_ENABLE | LCDC_TILE_DATA
+            | LCDC_WINDOW_TILE_MAP); // bit 5 cleared
+        ppu.write(0xff4a, 0);
+        ppu.write(0xff4b, 7);
+        ppu.tick(TO_HBLANK);
+        assert_eq!(ppu.framebuffer().pixel(0, 0), 1); // BG color 1, not window 3
+    }
+
+    #[test]
+    fn window_dies_when_bg_master_is_off() {
+        let mut ppu = ppu_with_bg_and_window();
+        ppu.write(0xff40, LCDC_LCD_ENABLE | LCDC_WINDOW_ENABLE | LCDC_TILE_DATA
+            | LCDC_WINDOW_TILE_MAP); // LCDC.0 cleared -> kills both BG and window
+        ppu.write(0xff4a, 0);
+        ppu.write(0xff4b, 7);
+        ppu.tick(TO_HBLANK);
+        // With both layers off the line stays shade 0.
+        assert_eq!(ppu.framebuffer().pixel(0, 0), 0);
+    }
+
+    #[test]
+    fn window_line_counter_advances_independently_of_ly() {
+        // Window line N reads from window-map row N/8. Switch window-map
+        // tiles per row so we can prove WLY counts only window-rendered
+        // scanlines, not raw LY.
+        let mut ppu = ppu_with_bg_and_window();
+        // Window-map row 0 (tiles $9C00..$9C1F): tile 1 -> shade 3.
+        // Window-map row 1 (tiles $9C20..$9C3F): tile 2 -> shade with color 0
+        // (need tile 2 defined; we use an empty tile so color 0 -> shade 0).
+        for cell in 0x9c20_u16..0x9c40 {
+            ppu.write_vram(cell, 2);
+        }
+        // Tile 2 stays all zeros (color 0 -> shade 0).
+
+        ppu.write(0xff4a, 4); // window starts at LY 4
+        ppu.write(0xff4b, 7);
+
+        // Run lines 0..3 (window invisible — WLY stays at 0).
+        ppu.tick(TO_HBLANK + 456 * 3);
+        // Line 4: first window line -> uses WLY=0 -> window-map row 0 -> shade 3.
+        ppu.tick(456);
+        assert_eq!(ppu.framebuffer().pixel(0, 4), 3, "first window line is map row 0");
+        // Lines 5..11: WLY 1..7 still in map row 0 -> shade 3.
+        for _ in 0..7 {
+            ppu.tick(456);
+        }
+        assert_eq!(ppu.framebuffer().pixel(0, 11), 3, "WLY 7 still map row 0");
+        // Line 12: WLY 8 lands on map row 1 (tile 2 -> shade 0).
+        ppu.tick(456);
+        assert_eq!(ppu.framebuffer().pixel(0, 12), 0, "WLY 8 jumps to map row 1");
+    }
+
+    #[test]
+    fn wly_resets_at_frame_start() {
+        let mut ppu = ppu_with_bg_and_window();
+        ppu.write(0xff4a, 0);
+        ppu.write(0xff4b, 7);
+
+        // Advance through most of one frame so wly is large.
+        ppu.tick(TO_HBLANK + 456 * 100);
+        // Force a full frame to elapse: walk to the next LY=0.
+        ppu.tick(456 * 60); // overshoots VBlank and wraps
+
+        // wly should now be 0 again (and window-map row 0 has shade 3).
+        assert_eq!(ppu.framebuffer().pixel(0, 0), 3);
     }
 
     #[test]
