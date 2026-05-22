@@ -52,7 +52,6 @@ pub struct Mmu {
 enum OamBugKind {
     Read,
     Write,
-    ReadIdu,
     WriteIdu,
     Idu,
 }
@@ -179,23 +178,6 @@ impl Mmu {
         }
     }
 
-    fn apply_oam_read_idu_corruption(&mut self, row: usize) {
-        if (4..19).contains(&row) {
-            // Standard GBDev formula uses only a, b, c. The IDU formula is
-            // the *whole* corruption for a read+IDU access — real hardware
-            // does not also fire the plain-read pattern on the same M-cycle.
-            let a = self.oam_word(row - 2, 0);
-            let b = self.oam_word(row - 1, 0);
-            let c = self.oam_word(row, 0);
-            self.set_oam_word(row - 1, 0, (b & (a | c)) | (a & c));
-            for word in 1..4 {
-                let prev = self.oam_word(row - 1, word);
-                self.set_oam_word(row, word, prev);
-                self.set_oam_word(row - 2, word, prev);
-            }
-        }
-    }
-
     fn maybe_apply_oam_bug(&mut self, addr: u16, kind: OamBugKind) {
         if !(0xfe00..=0xfeff).contains(&addr) {
             return;
@@ -209,7 +191,6 @@ impl Mmu {
             OamBugKind::Write | OamBugKind::WriteIdu | OamBugKind::Idu => {
                 self.apply_oam_write_corruption(row);
             }
-            OamBugKind::ReadIdu => self.apply_oam_read_idu_corruption(row),
         }
     }
 
@@ -318,9 +299,11 @@ impl Bus for Mmu {
     }
 
     fn read8_cpu_idu(&mut self, addr: u16, idu_addr: u16) -> u8 {
-        let value = self.read8(addr);
-        self.maybe_apply_oam_bug(idu_addr, OamBugKind::ReadIdu);
-        value
+        // SameBoy's ld_a_dhli / ld_a_dhld emit only a cycle_read; the IDU
+        // bus stays quiet during the access so the read-side dispatcher
+        // (apply_oam_read_corruption) is the only thing that needs to fire.
+        let _ = idu_addr;
+        self.read8_cpu(addr)
     }
 
     fn write8_cpu_idu(&mut self, addr: u16, value: u8, idu_addr: u16) {

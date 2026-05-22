@@ -353,7 +353,10 @@ impl Cpu {
 
     fn call_nn(&mut self, bus: &mut impl Bus) -> u8 {
         let nn = self.fetch16(bus);
-        self.idle(bus);
+        // The internal M-cycle before the two pushes asserts SP on the IDU
+        // bus, so an SP that sits inside OAM trips the write-side bug just
+        // like the pushes themselves do.
+        self.idu_timed(bus, self.sp);
         self.push16(bus, self.pc);
         self.pc = nn;
         24
@@ -362,7 +365,7 @@ impl Cpu {
     fn call_cc(&mut self, cc: u8, bus: &mut impl Bus) -> u8 {
         let nn = self.fetch16(bus);
         if self.cc_satisfied(cc) {
-            self.idle(bus);
+            self.idu_timed(bus, self.sp);
             self.push16(bus, self.pc);
             self.pc = nn;
             24
@@ -384,7 +387,8 @@ impl Cpu {
     }
 
     fn rst(&mut self, vector: u16, bus: &mut impl Bus) -> u8 {
-        self.idle(bus);
+        // Same IDU exposure as PUSH/CALL before the two pushes.
+        self.idu_timed(bus, self.sp);
         self.push16(bus, self.pc);
         self.pc = vector;
         16
@@ -905,7 +909,7 @@ impl Cpu {
             }
             0xc4 => self.call_cc(0, bus), // CALL NZ
             0xc5 => {
-                self.idle(bus);
+                self.idu_timed(bus, self.sp);
                 self.push16(bus, self.bc());
                 16
             }
@@ -940,7 +944,7 @@ impl Cpu {
             0xd2 => self.jp_cc(2, bus),   // JP NC, nn
             0xd4 => self.call_cc(2, bus), // CALL NC
             0xd5 => {
-                self.idle(bus);
+                self.idu_timed(bus, self.sp);
                 self.push16(bus, self.de());
                 16
             }
@@ -981,7 +985,7 @@ impl Cpu {
                 8
             }
             0xe5 => {
-                self.idle(bus);
+                self.idu_timed(bus, self.sp);
                 self.push16(bus, self.hl());
                 16
             }
@@ -1033,7 +1037,7 @@ impl Cpu {
                 4
             }
             0xf5 => {
-                self.idle(bus);
+                self.idu_timed(bus, self.sp);
                 self.push16(bus, self.af());
                 16
             }
