@@ -36,7 +36,8 @@ fn vblank_jumps_cpu_to_vector_0x40() {
     cpu.sp = 0xfffe;
     cpu.ime = true;
 
-    // Arm VBlank only.
+    // Enable the LCD so the PPU advances; arm VBlank only.
+    mmu.write8(0xff40, 0x80);
     mmu.write8(0xffff, 0x01);
 
     // Drive until the ISR halts the CPU. Need ~5500 JR iterations

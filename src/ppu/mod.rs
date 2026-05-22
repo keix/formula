@@ -12,6 +12,9 @@ const STAT_INT_OAM: u8 = 1 << 5;
 const STAT_INT_VBLANK: u8 = 1 << 4;
 const STAT_INT_HBLANK: u8 = 1 << 3;
 
+// LCD enable bit within the LCDC register.
+const LCDC_LCD_ENABLE: u8 = 1 << 7;
+
 pub struct Ppu {
     pub regs: Registers,
     framebuffer: Framebuffer,
@@ -63,7 +66,7 @@ impl Ppu {
 
     pub fn write(&mut self, addr: u16, value: u8) {
         match addr {
-            0xff40 => self.regs.lcdc = value,
+            0xff40 => self.write_lcdc(value),
             0xff41 => self.write_stat(value),
             0xff42 => self.regs.scy = value,
             0xff43 => self.regs.scx = value,
@@ -96,6 +99,21 @@ impl Ppu {
         self.regs.stat_select = value & 0b0111_1000;
     }
 
+    fn write_lcdc(&mut self, value: u8) {
+        let was_on = (self.regs.lcdc & LCDC_LCD_ENABLE) != 0;
+        let now_on = (value & LCDC_LCD_ENABLE) != 0;
+        self.regs.lcdc = value;
+        if was_on && !now_on {
+            // Disabling the LCD halts the PPU. Hardware reports LY=0 and the
+            // STAT mode bits as 0 (HBlank) while the LCD is off; the STAT IRQ
+            // line drops so re-enabling produces a fresh rising edge.
+            self.regs.ly = 0;
+            self.dots = 0;
+            self.mode = PpuMode::HBlank;
+            self.stat_line = false;
+        }
+    }
+
     fn compute_stat_line(&self) -> bool {
         let s = self.regs.stat_select;
         if (s & STAT_INT_LYC) != 0 && self.regs.ly == self.regs.lyc {
@@ -111,6 +129,9 @@ impl Ppu {
 
     /// Advance the PPU by `cycles` dots and return any IF bits to set.
     pub fn tick(&mut self, cycles: u32) -> u8 {
+        if (self.regs.lcdc & LCDC_LCD_ENABLE) == 0 {
+            return 0;
+        }
         let mut interrupts = 0;
         for _ in 0..cycles {
             self.dots += 1;
@@ -156,16 +177,22 @@ impl Default for Ppu {
 mod tests {
     use super::*;
 
+    fn ppu_on() -> Ppu {
+        let mut ppu = Ppu::new();
+        ppu.write(0xff40, LCDC_LCD_ENABLE);
+        ppu
+    }
+
     #[test]
     fn ppu_advances_ly_after_456_dots() {
-        let mut ppu = Ppu::new();
+        let mut ppu = ppu_on();
         ppu.tick(456);
         assert_eq!(ppu.regs.ly, 1);
     }
 
     #[test]
     fn ppu_mode_transitions_within_a_line() {
-        let mut ppu = Ppu::new();
+        let mut ppu = ppu_on();
 
         assert_eq!(ppu.mode(), PpuMode::OamSearch);
         ppu.tick(79);
@@ -183,7 +210,7 @@ mod tests {
 
     #[test]
     fn ppu_enters_vblank_at_ly_144() {
-        let mut ppu = Ppu::new();
+        let mut ppu = ppu_on();
         ppu.tick(456 * 144);
 
         assert_eq!(ppu.regs.ly, 144);
@@ -192,7 +219,7 @@ mod tests {
 
     #[test]
     fn ppu_stays_in_vblank_throughout_lines_144_to_153() {
-        let mut ppu = Ppu::new();
+        let mut ppu = ppu_on();
         ppu.tick(456 * 144);
         assert_eq!(ppu.mode(), PpuMode::VBlank);
 
@@ -204,7 +231,7 @@ mod tests {
 
     #[test]
     fn ppu_wraps_ly_after_a_full_frame() {
-        let mut ppu = Ppu::new();
+        let mut ppu = ppu_on();
         ppu.tick(456 * 154);
 
         assert_eq!(ppu.regs.ly, 0);
@@ -213,7 +240,7 @@ mod tests {
 
     #[test]
     fn tick_returns_vblank_bit_once_per_frame() {
-        let mut ppu = Ppu::new();
+        let mut ppu = ppu_on();
 
         assert_eq!(ppu.tick(456 * 144 - 1), 0);
         assert_eq!(ppu.tick(1), 0x01);
@@ -223,7 +250,7 @@ mod tests {
 
     #[test]
     fn stat_read_carries_mode_bits() {
-        let mut ppu = Ppu::new();
+        let mut ppu = ppu_on();
         assert_eq!(ppu.read(0xff41) & 0b11, 0b10);
 
         ppu.tick(80);
@@ -238,7 +265,7 @@ mod tests {
 
     #[test]
     fn stat_coincidence_bit_reflects_ly_eq_lyc() {
-        let mut ppu = Ppu::new();
+        let mut ppu = ppu_on();
         ppu.write(0xff45, 0);
         assert_eq!(ppu.read(0xff41) & 0b100, 0b100);
 
@@ -251,7 +278,7 @@ mod tests {
 
     #[test]
     fn stat_write_only_touches_interrupt_enable_bits() {
-        let mut ppu = Ppu::new();
+        let mut ppu = ppu_on();
         ppu.write(0xff41, 0xff);
 
         let read = ppu.read(0xff41);
@@ -260,7 +287,7 @@ mod tests {
 
     #[test]
     fn write_to_ly_resets_to_zero() {
-        let mut ppu = Ppu::new();
+        let mut ppu = ppu_on();
         ppu.tick(456 * 5);
         assert_eq!(ppu.regs.ly, 5);
 
@@ -270,7 +297,7 @@ mod tests {
 
     #[test]
     fn stat_interrupt_fires_on_oam_search_entry() {
-        let mut ppu = Ppu::new();
+        let mut ppu = ppu_on();
         // Initial mode is OAM Search; line is LOW until source is enabled.
         ppu.write(0xff41, STAT_INT_OAM);
         // First tick raises the line LOW -> HIGH.
@@ -279,7 +306,7 @@ mod tests {
 
     #[test]
     fn stat_interrupt_fires_on_hblank_entry() {
-        let mut ppu = Ppu::new();
+        let mut ppu = ppu_on();
         ppu.write(0xff41, STAT_INT_HBLANK);
 
         // No HBlank source matched yet (we are still in OAM/Drawing)
@@ -290,7 +317,7 @@ mod tests {
 
     #[test]
     fn stat_interrupt_fires_on_vblank_entry_alongside_vblank_if() {
-        let mut ppu = Ppu::new();
+        let mut ppu = ppu_on();
         ppu.write(0xff41, STAT_INT_VBLANK);
 
         let mut total = 0_u8;
@@ -303,7 +330,7 @@ mod tests {
 
     #[test]
     fn stat_interrupt_fires_on_lyc_match() {
-        let mut ppu = Ppu::new();
+        let mut ppu = ppu_on();
         ppu.write(0xff45, 5); // LYC = 5
         ppu.write(0xff41, STAT_INT_LYC);
 
@@ -316,7 +343,7 @@ mod tests {
 
     #[test]
     fn stat_interrupt_does_not_fire_when_sources_disabled() {
-        let mut ppu = Ppu::new();
+        let mut ppu = ppu_on();
         // No STAT sources enabled
         let mut total = 0_u8;
         for _ in 0..(456 * 144) {
@@ -328,7 +355,7 @@ mod tests {
 
     #[test]
     fn stat_interrupt_does_not_refire_while_line_stays_high() {
-        let mut ppu = Ppu::new();
+        let mut ppu = ppu_on();
         ppu.write(0xff41, STAT_INT_OAM);
 
         // First cycle fires
@@ -344,7 +371,7 @@ mod tests {
 
     #[test]
     fn overlapping_stat_sources_fire_only_once_per_rising_edge() {
-        let mut ppu = Ppu::new();
+        let mut ppu = ppu_on();
         ppu.write(0xff45, 0); // LYC = LY = 0, so LYC source is true from the start
         ppu.write(0xff41, STAT_INT_LYC | STAT_INT_OAM);
 
@@ -358,5 +385,58 @@ mod tests {
             total |= ppu.tick(1);
         }
         assert_eq!(total & 0x02, 0);
+    }
+
+    #[test]
+    fn disabling_lcd_freezes_the_ppu() {
+        let mut ppu = ppu_on();
+        ppu.tick(456 * 3 + 100); // somewhere into line 3
+
+        ppu.write(0xff40, 0); // LCD off
+        assert_eq!(ppu.regs.ly, 0);
+        assert_eq!(ppu.mode(), PpuMode::HBlank);
+
+        // Subsequent ticks must not advance state or raise interrupts.
+        let irqs = ppu.tick(456 * 200);
+        assert_eq!(irqs, 0);
+        assert_eq!(ppu.regs.ly, 0);
+        assert_eq!(ppu.mode(), PpuMode::HBlank);
+    }
+
+    #[test]
+    fn stat_reads_mode_zero_while_lcd_is_off() {
+        let mut ppu = ppu_on();
+        ppu.tick(80); // enter Drawing
+        assert_eq!(ppu.read(0xff41) & 0b11, 0b11);
+
+        ppu.write(0xff40, 0);
+        assert_eq!(ppu.read(0xff41) & 0b11, 0b00);
+    }
+
+    #[test]
+    fn re_enabling_lcd_restarts_from_line_zero() {
+        let mut ppu = ppu_on();
+        ppu.tick(456 * 50);
+        ppu.write(0xff40, 0);
+
+        ppu.write(0xff40, LCDC_LCD_ENABLE);
+        assert_eq!(ppu.regs.ly, 0);
+        assert_eq!(ppu.mode(), PpuMode::HBlank);
+
+        ppu.tick(1);
+        assert_eq!(ppu.mode(), PpuMode::OamSearch);
+    }
+
+    #[test]
+    fn stat_interrupt_stays_quiet_while_lcd_is_off() {
+        let mut ppu = ppu_on();
+        ppu.write(0xff41, STAT_INT_OAM | STAT_INT_HBLANK | STAT_INT_VBLANK | STAT_INT_LYC);
+        ppu.write(0xff40, 0);
+
+        let mut total = 0_u8;
+        for _ in 0..(456 * 200) {
+            total |= ppu.tick(1);
+        }
+        assert_eq!(total, 0);
     }
 }
