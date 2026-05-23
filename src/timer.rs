@@ -4,14 +4,17 @@
 //! is its high byte, so any write to DIV clears the whole counter.
 //! TIMA increments on a falling edge of a selected counter bit (bit
 //! 9 / 3 / 5 / 7 for TAC clock 00 / 01 / 10 / 11 — i.e. every 1024
-//! / 16 / 64 / 256 T-cycles). When TIMA overflows it reloads from
-//! TMA and tick() returns true so the MMU can raise IF bit 2.
+//! / 16 / 64 / 256 T-cycles). To better match hardware, writes to
+//! DIV/TAC can themselves create a falling edge and increment TIMA,
+//! and a TIMA overflow spends 4 T-cycles at 0x00 before reloading
+//! from TMA and raising IF bit 2.
 
 pub struct Timer {
     counter: u16, // internal 16-bit counter; DIV is the high byte
     tima: u8,
     tma: u8,
     tac: u8,
+    overflow_delay: Option<u8>,
 }
 
 impl Timer {
@@ -21,6 +24,57 @@ impl Timer {
             tima: 0,
             tma: 0,
             tac: 0,
+            overflow_delay: None,
+        }
+    }
+
+    fn selected_mask(tac: u8) -> u16 {
+        1_u16
+            << match tac & 0x03 {
+                0 => 9, // 4096 Hz
+                1 => 3, // 262144 Hz
+                2 => 5, // 65536 Hz
+                3 => 7, // 16384 Hz
+                _ => unreachable!(),
+            }
+    }
+
+    fn timer_input(counter: u16, tac: u8) -> bool {
+        tac & 0x04 != 0 && (counter & Self::selected_mask(tac)) != 0
+    }
+
+    fn increment_tima(&mut self) {
+        let (new_tima, overflow) = self.tima.overflowing_add(1);
+        if overflow {
+            self.tima = 0x00;
+            self.overflow_delay = Some(4);
+        } else {
+            self.tima = new_tima;
+        }
+    }
+
+    fn advance_overflow(&mut self) -> bool {
+        match self.overflow_delay {
+            Some(1) => {
+                self.overflow_delay = None;
+                self.tima = self.tma;
+                true
+            }
+            Some(delay) => {
+                self.overflow_delay = Some(delay - 1);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn apply_timer_control_write(&mut self, new_counter: u16, new_tac: u8) {
+        let old_input = Self::timer_input(self.counter, self.tac);
+        let new_input = Self::timer_input(new_counter, new_tac);
+        self.counter = new_counter;
+        self.tac = new_tac;
+        if old_input && !new_input {
+            self.increment_tima();
         }
     }
 
@@ -41,10 +95,13 @@ impl Timer {
     /// just its high byte.
     pub fn write(&mut self, addr: u16, value: u8) {
         match addr {
-            0xff04 => self.counter = 0, // any write to DIV clears the internal counter
-            0xff05 => self.tima = value,
+            0xff04 => self.apply_timer_control_write(0, self.tac),
+            0xff05 => {
+                self.overflow_delay = None;
+                self.tima = value;
+            }
             0xff06 => self.tma = value,
-            0xff07 => self.tac = value & 0x07,
+            0xff07 => self.apply_timer_control_write(self.counter, value & 0x07),
             _ => panic!("Timer: unmapped write at {:#06x}", addr),
         }
     }
@@ -54,26 +111,14 @@ impl Timer {
     pub fn tick(&mut self, cycles: u8) -> bool {
         let mut interrupt = false;
         for _ in 0..cycles {
+            interrupt |= self.advance_overflow();
+
             let old_counter = self.counter;
             self.counter = self.counter.wrapping_add(1);
 
-            if self.tac & 0x04 != 0 {
-                let bit = match self.tac & 0x03 {
-                    0 => 9, // 4096 Hz
-                    1 => 3, // 262144 Hz
-                    2 => 5, // 65536 Hz
-                    3 => 7, // 16384 Hz
-                    _ => unreachable!(),
-                };
-                let mask = 1_u16 << bit;
-                // Falling edge on the selected bit increments TIMA
-                if (old_counter & mask) != 0 && (self.counter & mask) == 0 {
-                    let (new_tima, overflow) = self.tima.overflowing_add(1);
-                    self.tima = if overflow { self.tma } else { new_tima };
-                    if overflow {
-                        interrupt = true;
-                    }
-                }
+            if Self::timer_input(old_counter, self.tac) && !Self::timer_input(self.counter, self.tac)
+            {
+                self.increment_tima();
             }
         }
         interrupt
@@ -115,6 +160,17 @@ mod tests {
         timer.write(0xff04, 0x42); // value ignored, counter reset
 
         assert_eq!(timer.read(0xff04), 0);
+    }
+
+    #[test]
+    fn div_write_can_increment_tima_via_falling_edge() {
+        let mut timer = Timer::new();
+        timer.write(0xff07, 0x05); // enable, clock 01 -> bit 3
+        timer.tick(8); // counter bit 3 is now high
+
+        timer.write(0xff04, 0x00);
+
+        assert_eq!(timer.read(0xff05), 1);
     }
 
     #[test]
@@ -167,10 +223,45 @@ mod tests {
         assert!(!interrupt);
         assert_eq!(timer.read(0xff05), 0xff);
 
-        // 16th cycle: TIMA overflows, reloads TMA, raises interrupt
+        // 16th cycle: TIMA overflows and spends 4 cycles at 0x00.
+        interrupt = timer.tick(1);
+        assert!(!interrupt);
+        assert_eq!(timer.read(0xff05), 0x00);
+
+        interrupt |= timer.tick(3);
+        assert!(!interrupt);
+        assert_eq!(timer.read(0xff05), 0x00);
+
         interrupt = timer.tick(1);
         assert!(interrupt);
         assert_eq!(timer.read(0xff05), 0x42);
+    }
+
+    #[test]
+    fn writing_tima_during_overflow_delay_cancels_reload() {
+        let mut timer = Timer::new();
+        timer.write(0xff05, 0xff);
+        timer.write(0xff06, 0x42);
+        timer.write(0xff07, 0x05);
+
+        timer.tick(16);
+        assert_eq!(timer.read(0xff05), 0x00);
+
+        timer.write(0xff05, 0x99);
+
+        assert!(!timer.tick(4));
+        assert_eq!(timer.read(0xff05), 0x99);
+    }
+
+    #[test]
+    fn tac_write_can_increment_tima_via_falling_edge() {
+        let mut timer = Timer::new();
+        timer.write(0xff07, 0x05); // enable, bit 3
+        timer.tick(8); // bit 3 high
+
+        timer.write(0xff07, 0x04); // switch to bit 9, input falls low
+
+        assert_eq!(timer.read(0xff05), 1);
     }
 
     #[test]

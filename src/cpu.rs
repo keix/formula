@@ -39,6 +39,11 @@ pub struct Cpu {
     pub halt_bug: bool,
     pub locked: bool,
     ime_delay: u8,
+    // Set on the M-cycle HALT was decoded; the first halted iteration ticks
+    // 4 cycles without a mid-cycle pending check, matching SameBoy's
+    // `just_halted` semantics. Subsequent halted iterations split into
+    // 2 + check + 2 so the wake can land mid-M-cycle, like real DMG.
+    just_halted: bool,
 }
 
 impl Cpu {
@@ -57,6 +62,7 @@ impl Cpu {
             halted: false,
             ime: false,
             halt_bug: false,
+            just_halted: false,
             locked: false,
             ime_delay: 0,
         }
@@ -106,12 +112,27 @@ impl Cpu {
 
     fn read8_timed(&mut self, bus: &mut impl Bus, addr: u16) -> u8 {
         self.mcycle(bus);
-        bus.read8(addr)
+        bus.read8_cpu(addr)
     }
 
     fn write8_timed(&mut self, bus: &mut impl Bus, addr: u16, value: u8) {
         self.mcycle(bus);
-        bus.write8(addr, value);
+        bus.write8_cpu(addr, value);
+    }
+
+    fn read8_timed_idu(&mut self, bus: &mut impl Bus, addr: u16, idu_addr: u16) -> u8 {
+        self.mcycle(bus);
+        bus.read8_cpu_idu(addr, idu_addr)
+    }
+
+    fn write8_timed_idu(&mut self, bus: &mut impl Bus, addr: u16, value: u8, idu_addr: u16) {
+        self.mcycle(bus);
+        bus.write8_cpu_idu(addr, value, idu_addr);
+    }
+
+    fn idu_timed(&mut self, bus: &mut impl Bus, addr: u16) {
+        self.mcycle(bus);
+        bus.idu_glitch_cpu(addr);
     }
 
     fn fetch8(&mut self, bus: &mut impl Bus) -> u8 {
@@ -138,13 +159,19 @@ impl Cpu {
 
     fn push16(&mut self, bus: &mut impl Bus, value: u16) {
         let [hi, lo] = value.to_be_bytes();
+        let idu_addr = self.sp;
         self.sp = self.sp.wrapping_sub(1);
-        self.write8_timed(bus, self.sp, hi);
+        self.write8_timed_idu(bus, self.sp, hi, idu_addr);
+        let idu_addr = self.sp;
         self.sp = self.sp.wrapping_sub(1);
-        self.write8_timed(bus, self.sp, lo);
+        self.write8_timed_idu(bus, self.sp, lo, idu_addr);
     }
 
     fn pop16(&mut self, bus: &mut impl Bus) -> u16 {
+        // POP rp triggers only the read-side OAM bug (the dispatcher in
+        // Mmu::apply_oam_read_corruption picks the right pattern per row).
+        // The IDU bus stays quiet during POP's reads — matching SameBoy's
+        // `pop_rr` which only emits cycle_read calls.
         let lo = self.read8_timed(bus, self.sp);
         self.sp = self.sp.wrapping_add(1);
         let hi = self.read8_timed(bus, self.sp);
@@ -332,7 +359,10 @@ impl Cpu {
 
     fn call_nn(&mut self, bus: &mut impl Bus) -> u8 {
         let nn = self.fetch16(bus);
-        self.idle(bus);
+        // The internal M-cycle before the two pushes asserts SP on the IDU
+        // bus, so an SP that sits inside OAM trips the write-side bug just
+        // like the pushes themselves do.
+        self.idu_timed(bus, self.sp);
         self.push16(bus, self.pc);
         self.pc = nn;
         24
@@ -341,7 +371,7 @@ impl Cpu {
     fn call_cc(&mut self, cc: u8, bus: &mut impl Bus) -> u8 {
         let nn = self.fetch16(bus);
         if self.cc_satisfied(cc) {
-            self.idle(bus);
+            self.idu_timed(bus, self.sp);
             self.push16(bus, self.pc);
             self.pc = nn;
             24
@@ -363,7 +393,8 @@ impl Cpu {
     }
 
     fn rst(&mut self, vector: u16, bus: &mut impl Bus) -> u8 {
-        self.idle(bus);
+        // Same IDU exposure as PUSH/CALL before the two pushes.
+        self.idu_timed(bus, self.sp);
         self.push16(bus, self.pc);
         self.pc = vector;
         16
@@ -540,19 +571,35 @@ impl Cpu {
         }
     }
 
-    fn service_interrupt(&mut self, bus: &mut impl Bus, pending: u8) -> u8 {
-        let bit = pending.trailing_zeros() as u8;
-        let vector = 0x40_u16 + u16::from(bit) * 8;
-
+    fn service_interrupt(&mut self, bus: &mut impl Bus, _pending: u8) -> u8 {
         self.ime = false;
-        let if_ = bus.read8(0xff0f);
-        bus.write8(0xff0f, if_ & !(1u8 << bit));
 
         self.idle(bus);
         self.idle(bus);
         self.idle(bus);
-        self.push16(bus, self.pc);
-        self.pc = vector;
+
+        let [hi, lo] = self.pc.to_be_bytes();
+        let idu_addr = self.sp;
+        self.sp = self.sp.wrapping_sub(1);
+        self.write8_timed_idu(bus, self.sp, hi, idu_addr);
+
+        // Real hardware chooses and acknowledges the interrupt only after the
+        // stack writes have run, so SP aliasing IE/IF can change the vector.
+        let mut pending = bus.read8(0xffff) & 0x1f;
+        let idu_addr = self.sp;
+        self.sp = self.sp.wrapping_sub(1);
+        self.write8_timed_idu(bus, self.sp, lo, idu_addr);
+        pending &= bus.read8(0xff0f) & 0x1f;
+
+        if pending != 0 {
+            let bit = pending.trailing_zeros() as u8;
+            let vector = 0x40_u16 + u16::from(bit) * 8;
+            let if_ = bus.read8(0xff0f);
+            bus.write8(0xff0f, if_ & !(1u8 << bit));
+            self.pc = vector;
+        } else {
+            self.pc = 0x0000;
+        }
 
         20
     }
@@ -583,13 +630,31 @@ impl Cpu {
         }
 
         if self.ime && pending != 0 {
+            self.just_halted = false;
             return self.service_interrupt(bus, pending);
         }
 
         if self.halted {
-            self.idle(bus);
+            // Real DMG splits halted M-cycles into two halves so a pending
+            // event raised at the half-cycle mark wakes the CPU 2 T-cycles
+            // earlier than a 4-cycle tick would allow. The first halted
+            // iteration (just after HALT decoded) stays at a single 4-cycle
+            // tick; from the next iteration onward we tick 2, re-sample
+            // the pending mask, and tick 2 more.
+            if self.just_halted {
+                self.idle(bus);
+                self.just_halted = false;
+            } else {
+                bus.tick(2);
+                let pending_mid = bus.read8(0xff0f) & bus.read8(0xffff) & 0x1f;
+                if pending_mid != 0 {
+                    self.halted = false;
+                }
+                bus.tick(2);
+            }
             return 4;
         }
+        self.just_halted = false;
 
         let opcode = self.fetch8(bus);
         let cycles = match opcode {
@@ -604,7 +669,7 @@ impl Cpu {
                 8
             }
             0x03 => {
-                self.idle(bus);
+                self.idu_timed(bus, self.bc());
                 self.set_bc(self.bc().wrapping_add(1));
                 8
             }
@@ -636,7 +701,7 @@ impl Cpu {
                 8
             }
             0x0b => {
-                self.idle(bus);
+                self.idu_timed(bus, self.bc());
                 self.set_bc(self.bc().wrapping_sub(1));
                 8
             }
@@ -669,7 +734,7 @@ impl Cpu {
                 8
             }
             0x13 => {
-                self.idle(bus);
+                self.idu_timed(bus, self.de());
                 self.set_de(self.de().wrapping_add(1));
                 8
             }
@@ -700,7 +765,7 @@ impl Cpu {
                 8
             }
             0x1b => {
-                self.idle(bus);
+                self.idu_timed(bus, self.de());
                 self.set_de(self.de().wrapping_sub(1));
                 8
             }
@@ -722,12 +787,13 @@ impl Cpu {
                 12
             }
             0x22 => {
-                self.write8_timed(bus, self.hl(), self.a);
+                let hl = self.hl();
+                self.write8_timed_idu(bus, hl, self.a, hl);
                 self.set_hl(self.hl().wrapping_add(1));
                 8
             }
             0x23 => {
-                self.idle(bus);
+                self.idu_timed(bus, self.hl());
                 self.set_hl(self.hl().wrapping_add(1));
                 8
             }
@@ -748,12 +814,13 @@ impl Cpu {
                 8
             }
             0x2a => {
-                self.a = self.read8_timed(bus, self.hl());
+                let hl = self.hl();
+                self.a = self.read8_timed_idu(bus, hl, hl);
                 self.set_hl(self.hl().wrapping_add(1));
                 8
             }
             0x2b => {
-                self.idle(bus);
+                self.idu_timed(bus, self.hl());
                 self.set_hl(self.hl().wrapping_sub(1));
                 8
             }
@@ -775,12 +842,13 @@ impl Cpu {
                 12
             }
             0x32 => {
-                self.write8_timed(bus, self.hl(), self.a);
+                let hl = self.hl();
+                self.write8_timed_idu(bus, hl, self.a, hl);
                 self.set_hl(self.hl().wrapping_sub(1));
                 8
             }
             0x33 => {
-                self.idle(bus);
+                self.idu_timed(bus, self.sp);
                 self.sp = self.sp.wrapping_add(1);
                 8
             }
@@ -804,12 +872,13 @@ impl Cpu {
                 8
             }
             0x3a => {
-                self.a = self.read8_timed(bus, self.hl());
+                let hl = self.hl();
+                self.a = self.read8_timed_idu(bus, hl, hl);
                 self.set_hl(self.hl().wrapping_sub(1));
                 8
             }
             0x3b => {
-                self.idle(bus);
+                self.idu_timed(bus, self.sp);
                 self.sp = self.sp.wrapping_sub(1);
                 8
             }
@@ -827,10 +896,33 @@ impl Cpu {
                 4
             }
             0x76 => {
-                if !self.ime && pending != 0 {
-                    self.halt_bug = true;
+                // Real DMG performs a CPU-side read at PC during HALT's M-
+                // cycle (SameBoy's halt() calls cycle_read(gb->pc) before
+                // the pending check). It does not advance time on its own
+                // — the opcode fetch above has already done the 4-cycle
+                // tick — but it does fire any address-bus side effects
+                // such as the OAM corruption bug.
+                let _ = bus.read8_cpu(self.pc);
+
+                // Re-sample IE & IF here: the opcode fetch ticked the bus
+                // 4 cycles, which can have raised a new IF bit (timer
+                // overflow, PPU mode transition, etc.). Blargg's halt_bug
+                // test cares about the pending state *at HALT execution*,
+                // not at the start of the step.
+                let pending_now = bus.read8(0xff0f) & bus.read8(0xffff) & 0x1f;
+                if pending_now != 0 {
+                    if self.ime {
+                        // HALT yields immediately to the pending IRQ. PC
+                        // rewinds so the ISR's return address points at the
+                        // HALT itself — matching real DMG's "re-run HALT
+                        // after RETI" semantics.
+                        self.pc = self.pc.wrapping_sub(1);
+                    } else {
+                        self.halt_bug = true;
+                    }
                 } else {
                     self.halted = true;
+                    self.just_halted = true;
                 }
                 4
             }
@@ -880,7 +972,7 @@ impl Cpu {
             }
             0xc4 => self.call_cc(0, bus), // CALL NZ
             0xc5 => {
-                self.idle(bus);
+                self.idu_timed(bus, self.sp);
                 self.push16(bus, self.bc());
                 16
             }
@@ -915,7 +1007,7 @@ impl Cpu {
             0xd2 => self.jp_cc(2, bus),   // JP NC, nn
             0xd4 => self.call_cc(2, bus), // CALL NC
             0xd5 => {
-                self.idle(bus);
+                self.idu_timed(bus, self.sp);
                 self.push16(bus, self.de());
                 16
             }
@@ -956,7 +1048,7 @@ impl Cpu {
                 8
             }
             0xe5 => {
-                self.idle(bus);
+                self.idu_timed(bus, self.sp);
                 self.push16(bus, self.hl());
                 16
             }
@@ -1008,7 +1100,7 @@ impl Cpu {
                 4
             }
             0xf5 => {
-                self.idle(bus);
+                self.idu_timed(bus, self.sp);
                 self.push16(bus, self.af());
                 16
             }
@@ -1085,6 +1177,39 @@ mod tests {
                 wrote_at: Cell::new(u32::MAX),
                 wrote_value: Cell::new(0),
             }
+        }
+    }
+
+    struct HaltWakeBus {
+        mem: Memory,
+        ticks: u32,
+        wake_at: u32,
+    }
+
+    impl HaltWakeBus {
+        fn new(wake_at: u32) -> Self {
+            Self {
+                mem: Memory::new(),
+                ticks: 0,
+                wake_at,
+            }
+        }
+    }
+
+    impl Bus for HaltWakeBus {
+        fn read8(&self, addr: u16) -> u8 {
+            match addr {
+                0xff0f if self.ticks >= self.wake_at => 0x01,
+                _ => self.mem.read8(addr),
+            }
+        }
+
+        fn write8(&mut self, addr: u16, value: u8) {
+            self.mem.write8(addr, value);
+        }
+
+        fn tick(&mut self, cycles: u8) {
+            self.ticks += u32::from(cycles);
         }
     }
 
@@ -1176,6 +1301,46 @@ mod tests {
         let cycles = cpu.step(&mut mem);
         assert_eq!(cpu.pc, pc);
         assert_eq!(cycles, 4);
+    }
+
+    #[test]
+    fn first_halt_iteration_does_not_midcycle_wake() {
+        let mut cpu = Cpu::new();
+        let mut bus = HaltWakeBus::new(2);
+        cpu.pc = 0x1000;
+        cpu.halted = true;
+        cpu.just_halted = true;
+        bus.write8(0x1000, 0x00); // NOP once we do wake
+        bus.write8(0xffff, 0x01);
+
+        let cycles = cpu.step(&mut bus);
+
+        assert_eq!(cycles, 4);
+        assert!(cpu.halted, "the first halted iteration should ignore the 2T wake edge");
+        assert_eq!(cpu.pc, 0x1000);
+        assert_eq!(bus.ticks, 4);
+    }
+
+    #[test]
+    fn halted_cpu_wakes_midcycle_on_later_iterations() {
+        let mut cpu = Cpu::new();
+        let mut bus = HaltWakeBus::new(2);
+        cpu.pc = 0x1000;
+        cpu.halted = true;
+        cpu.just_halted = false;
+        bus.write8(0x1000, 0x00); // NOP once we wake
+        bus.write8(0xffff, 0x01);
+
+        let cycles = cpu.step(&mut bus);
+
+        assert_eq!(cycles, 4);
+        assert!(!cpu.halted, "later halted iterations should wake on the 2T boundary");
+        assert_eq!(cpu.pc, 0x1000, "wake happens during the idle cycle, before executing the next opcode");
+        assert_eq!(bus.ticks, 4);
+
+        let next_cycles = cpu.step(&mut bus);
+        assert_eq!(next_cycles, 4);
+        assert_eq!(cpu.pc, 0x1001);
     }
 
     #[test]
@@ -1826,6 +1991,26 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_vector_is_resolved_after_stack_push_side_effects() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.pc = 0x1234;
+        cpu.sp = 0xff11;
+        cpu.ime = true;
+        mem.write8(0xff0f, 0x01); // VBlank pending
+        mem.write8(0xffff, 0x01); // VBlank enabled
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cycles, 20);
+        assert_eq!(cpu.sp, 0xff0f);
+        assert_eq!(mem.read8(0xff10), 0x12); // high byte landed first
+        assert_eq!(mem.read8(0xff0f), 0x34); // low byte overwrote IF before ack
+        assert_eq!(cpu.pc, 0x0000); // pending vanished, so the CPU vectors to 0
+        assert!(!cpu.ime);
+    }
+
+    #[test]
     fn interrupt_not_serviced_when_ime_disabled() {
         let mut cpu = Cpu::new();
         let mut mem = Memory::new();
@@ -1900,6 +2085,36 @@ mod tests {
             cpu.ime,
             "IME should be set after the instruction following EI"
         );
+    }
+
+    #[test]
+    fn ei_then_halt_enables_ime_after_halt_and_services_future_interrupt() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.pc = 0x1000;
+        cpu.sp = 0xfffe;
+        mem.write8(0x1000, 0xfb); // EI
+        mem.write8(0x1001, 0x76); // HALT
+
+        let ei_cycles = cpu.step(&mut mem);
+        assert_eq!(ei_cycles, 4);
+        assert!(!cpu.ime, "EI must not enable IME immediately");
+
+        let halt_cycles = cpu.step(&mut mem);
+        assert_eq!(halt_cycles, 4);
+        assert!(cpu.ime, "EI delay matures after HALT completes");
+        assert!(cpu.halted, "HALT should still enter the halted state with no pending IRQ");
+        assert_eq!(cpu.pc, 0x1002);
+
+        mem.write8(0xff0f, 0x01);
+        mem.write8(0xffff, 0x01);
+
+        let irq_cycles = cpu.step(&mut mem);
+        assert_eq!(irq_cycles, 20);
+        assert_eq!(cpu.pc, 0x0040);
+        assert_eq!(cpu.sp, 0xfffc);
+        assert_eq!(mem.read8(0xfffc), 0x02);
+        assert_eq!(mem.read8(0xfffd), 0x10);
     }
 
     #[test]

@@ -43,6 +43,17 @@ pub struct Mmu {
     // Set when the PPU just entered VBlank (i.e. completed a frame).
     // The display loop consumes this via take_frame_ready().
     frame_ready: bool,
+    // If the most recent CPU M-cycle overlapped a single mode-2 OAM scan row,
+    // cache that row so the following CPU access can apply the DMG OAM bug.
+    last_oam_bug_row: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+enum OamBugKind {
+    Read,
+    Write,
+    WriteIdu,
+    Idu,
 }
 
 impl Mmu {
@@ -59,6 +70,7 @@ impl Mmu {
             ie: 0,
             dma: 0,
             frame_ready: false,
+            last_oam_bug_row: None,
         }
     }
 
@@ -84,6 +96,104 @@ impl Mmu {
         }
     }
 
+    fn oam_word(&self, row: usize, word: usize) -> u16 {
+        debug_assert!(row < 20);
+        debug_assert!(word < 4);
+        let addr = 0xfe00 + (row as u16 * 8) + (word as u16 * 2);
+        let lo = self.ppu.read_oam(addr);
+        let hi = self.ppu.read_oam(addr + 1);
+        u16::from_le_bytes([lo, hi])
+    }
+
+    fn set_oam_word(&mut self, row: usize, word: usize, value: u16) {
+        debug_assert!(row < 20);
+        debug_assert!(word < 4);
+        let addr = 0xfe00 + (row as u16 * 8) + (word as u16 * 2);
+        let [lo, hi] = value.to_le_bytes();
+        self.ppu.write_oam(addr, lo);
+        self.ppu.write_oam(addr + 1, hi);
+    }
+
+    fn apply_oam_write_corruption(&mut self, row: usize) {
+        if row == 0 {
+            return;
+        }
+
+        let a = self.oam_word(row, 0);
+        let b = self.oam_word(row - 1, 0);
+        let c = self.oam_word(row - 1, 2);
+        self.set_oam_word(row, 0, ((a ^ c) & (b ^ c)) ^ c);
+        for word in 1..4 {
+            self.set_oam_word(row, word, self.oam_word(row - 1, word));
+        }
+    }
+
+    fn apply_oam_read_corruption(&mut self, row: usize) {
+        // Mirrors SameBoy's GB_trigger_oam_bug_read: the corruption pattern
+        // depends on the byte offset of the currently scanned OAM row, and
+        // the outer "copy previous row over current row" applies in every
+        // branch. byte_offset = row * 8 in our row-index model.
+        if row == 0 {
+            return;
+        }
+
+        match row & 0x3 {
+            // byte & 0x18 == 0x10: secondary read corruption (four-input
+            // glitch that uses prev-row word 2 in addition to a/b/c).
+            2 => {
+                if row >= 2 {
+                    let a = self.oam_word(row - 2, 0);
+                    let b = self.oam_word(row - 1, 0);
+                    let c = self.oam_word(row, 0);
+                    let d = self.oam_word(row - 1, 2);
+                    self.set_oam_word(row - 1, 0, (b & (a | c | d)) | (a & c & d));
+                    // Inner copy: previous row replicates over (row-2).
+                    for word in 0..4 {
+                        let v = self.oam_word(row - 1, word);
+                        self.set_oam_word(row - 2, word, v);
+                    }
+                }
+            }
+            // byte & 0x18 == 0x00: tertiary / quaternary, deeply model-
+            // and row-specific. Fall through to the simple pattern for
+            // the rows the current Blargg tests don't hit; revisit when
+            // we tackle the row 0x20 / 0x40 / 0x60 / 0x80 corner cases.
+            0 | 1 | 3 => {
+                let a = self.oam_word(row, 0);
+                let b = self.oam_word(row - 1, 0);
+                let c = self.oam_word(row - 1, 2);
+                let result = b | (a & c);
+                self.set_oam_word(row, 0, result);
+                self.set_oam_word(row - 1, 0, result);
+            }
+            _ => unreachable!(),
+        }
+
+        // Outer copy: previous row replicates over the current row entirely
+        // (this is what causes the corruption to cascade across the three
+        // adjacent rows the bug touches).
+        for word in 0..4 {
+            let v = self.oam_word(row - 1, word);
+            self.set_oam_word(row, word, v);
+        }
+    }
+
+    fn maybe_apply_oam_bug(&mut self, addr: u16, kind: OamBugKind) {
+        if !(0xfe00..=0xfeff).contains(&addr) {
+            return;
+        }
+        let Some(row) = self.last_oam_bug_row else {
+            return;
+        };
+
+        match kind {
+            OamBugKind::Read => self.apply_oam_read_corruption(row),
+            OamBugKind::Write | OamBugKind::WriteIdu | OamBugKind::Idu => {
+                self.apply_oam_write_corruption(row);
+            }
+        }
+    }
+
     /// Advance memory-mapped sub-systems by `cycles` T-cycles. Subsystems
     /// that raise interrupts set the corresponding bit in IF (0xFF0F).
     pub fn tick(&mut self, cycles: u8) {
@@ -91,6 +201,7 @@ impl Mmu {
             self.io[0x0f] |= 0x04; // Timer interrupt -> IF bit 2
         }
         let ppu_if = self.ppu.tick(u32::from(cycles));
+        self.last_oam_bug_row = self.ppu.oam_bug_row_for_access();
         if ppu_if != 0 {
             self.io[0x0f] |= ppu_if;
             if ppu_if & 0x01 != 0 {
@@ -119,6 +230,10 @@ impl Mmu {
     pub fn framebuffer(&self) -> &Framebuffer {
         self.ppu.framebuffer()
     }
+
+    fn write8_cpu_impl(&mut self, addr: u16, value: u8) {
+        self.write8(addr, value);
+    }
 }
 
 impl Bus for Mmu {
@@ -139,6 +254,7 @@ impl Bus for Mmu {
             0xff00 => self.joypad.read(addr),
             0xff01..=0xff02 => self.serial.read(addr),
             0xff04..=0xff07 => self.timer.read(addr),
+            0xff0f => self.io[0x0f] | 0xe0,
             0xff46 => self.dma,
             0xff40..=0xff4b => self.ppu.read(addr),
             0xff00..=0xff7f => self.io[(addr - 0xff00) as usize],
@@ -160,6 +276,7 @@ impl Bus for Mmu {
             0xff00 => self.joypad.write(addr, value),
             0xff01..=0xff02 => self.serial.write(addr, value),
             0xff04..=0xff07 => self.timer.write(addr, value),
+            0xff0f => self.io[0x0f] = value | 0xe0,
             0xff46 => self.start_oam_dma(value),
             0xff40..=0xff4b => self.ppu.write(addr, value),
             0xff00..=0xff7f => self.io[(addr - 0xff00) as usize] = value,
@@ -170,6 +287,34 @@ impl Bus for Mmu {
 
     fn tick(&mut self, cycles: u8) {
         Mmu::tick(self, cycles);
+    }
+
+    fn read8_cpu(&mut self, addr: u16) -> u8 {
+        let value = self.read8(addr);
+        self.maybe_apply_oam_bug(addr, OamBugKind::Read);
+        value
+    }
+
+    fn write8_cpu(&mut self, addr: u16, value: u8) {
+        self.write8_cpu_impl(addr, value);
+        self.maybe_apply_oam_bug(addr, OamBugKind::Write);
+    }
+
+    fn read8_cpu_idu(&mut self, addr: u16, idu_addr: u16) -> u8 {
+        // SameBoy's ld_a_dhli / ld_a_dhld emit only a cycle_read; the IDU
+        // bus stays quiet during the access so the read-side dispatcher
+        // (apply_oam_read_corruption) is the only thing that needs to fire.
+        let _ = idu_addr;
+        self.read8_cpu(addr)
+    }
+
+    fn write8_cpu_idu(&mut self, addr: u16, value: u8, idu_addr: u16) {
+        self.write8_cpu_impl(addr, value);
+        self.maybe_apply_oam_bug(idu_addr, OamBugKind::WriteIdu);
+    }
+
+    fn idu_glitch_cpu(&mut self, addr: u16) {
+        self.maybe_apply_oam_bug(addr, OamBugKind::Idu);
     }
 }
 
@@ -401,8 +546,9 @@ mod tests {
         mmu.write8(0xff06, 0x00); // TMA
         mmu.write8(0xff07, 0x05); // enable, clock 01 (every 16 cycles)
 
-        // Run 16 T-cycles to trigger overflow
-        mmu.tick(16);
+        // 16 T-cycles reaches the overflow edge, then 4 more cycles reload
+        // TIMA from TMA and raise IF bit 2.
+        mmu.tick(20);
 
         // IF (0xff0f) should have bit 2 set
         assert_eq!(mmu.read8(0xff0f) & 0x04, 0x04);
@@ -417,10 +563,30 @@ mod tests {
         mmu.write8(0xff05, 0xff);
         mmu.write8(0xff07, 0x05);
 
-        mmu.tick(16);
+        mmu.tick(20);
 
         // Both VBlank (bit 0) and Timer (bit 2) should be set
         assert_eq!(mmu.read8(0xff0f) & 0x05, 0x05);
+    }
+
+    #[test]
+    fn if_register_reads_back_with_upper_bits_set() {
+        let mut mmu = make_mmu();
+
+        mmu.write8(0xff0f, 0x01);
+
+        assert_eq!(mmu.read8(0xff0f), 0xe1);
+    }
+
+    #[test]
+    fn if_register_write_preserves_upper_bits_and_lower_payload() {
+        let mut mmu = make_mmu();
+
+        mmu.write8(0xff0f, 0x00);
+        assert_eq!(mmu.read8(0xff0f), 0xe0);
+
+        mmu.write8(0xff0f, 0x1f);
+        assert_eq!(mmu.read8(0xff0f), 0xff);
     }
 
     #[test]

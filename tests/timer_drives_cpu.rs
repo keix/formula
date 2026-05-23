@@ -59,9 +59,11 @@ fn timer_overflow_jumps_cpu_to_vector_0x50() {
     assert!(cpu.halted, "CPU never halted inside the ISR");
     assert_eq!(cpu.pc, 0x0051, "PC should be just past HALT inside the ISR");
 
-    // Service pushed the return address (the next NOP after the interrupted run).
+    // TIMA overflows at 16 T-cycles, then spends 4 more T-cycles at 0x00
+    // before the MMU raises IF. That lets the CPU complete one more NOP
+    // before servicing the interrupt.
     assert_eq!(cpu.sp, 0xfffc);
-    assert_eq!(mmu.read8(0xfffc), 0x04, "low byte of return PC on stack");
+    assert_eq!(mmu.read8(0xfffc), 0x05, "low byte of return PC on stack");
     assert_eq!(mmu.read8(0xfffd), 0x00, "high byte of return PC on stack");
 
     // Service cleared the Timer IF bit; IME was forced off.

@@ -91,6 +91,7 @@ fn main() -> ExitCode {
     let mut pixel_buffer: Vec<u32> = vec![0; WIDTH * HEIGHT];
     let mut total_cycles: u64 = 0;
     let mut parked = false;
+    let mut same_pc_count: u32 = 0;
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         if parked || cpu.locked || total_cycles >= MAX_CYCLES {
@@ -125,11 +126,18 @@ fn main() -> ExitCode {
             }
         }
 
-        // Blargg test ROMs (and many homebrew) park themselves in a tight
-        // `JR -2` after printing the result. Detect that and switch to
-        // idle mode so the user can see the final frame.
+        // Some ROMs transiently sit in a tight self-jump while waiting for an
+        // interrupt or LCD state change. Only treat a frozen PC as "parked"
+        // after it has stayed unchanged for a long stretch with the CPU still
+        // running. This preserves the convenience for finished test ROMs
+        // without prematurely idling active wait loops.
         if !cpu.halted && cpu.pc == pre_pc {
-            parked = true;
+            same_pc_count = same_pc_count.saturating_add(1);
+            if same_pc_count >= 1_000_000 {
+                parked = true;
+            }
+        } else {
+            same_pc_count = 0;
         }
     }
 
