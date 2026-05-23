@@ -49,6 +49,7 @@ const CPU_CLOCK_HZ: u32 = 4_194_304;
 const OUTPUT_SAMPLE_RATE: u32 = 48_000;
 const DC_BLOCK_COEFF: f32 = 0.996;
 const LOW_PASS_COEFF: f32 = 0.82;
+const WAVE_TRIGGER_DELAY_T: u16 = 3;
 const DUTY_PATTERNS: [u8; 4] = [0b0000_0001, 0b1000_0001, 0b1000_0111, 0b0111_1110];
 const NOISE_DIVISORS: [u16; 8] = [8, 16, 32, 48, 64, 80, 96, 112];
 
@@ -159,6 +160,14 @@ impl SweepState {
             negate_used: false,
             shadow_freq: 0,
         }
+    }
+}
+
+fn sweep_period(period: u8) -> u8 {
+    if period == 0 {
+        8
+    } else {
+        period
     }
 }
 
@@ -322,7 +331,7 @@ impl Apu {
 
     fn write_reg_raw(&mut self, addr: u16, value: u8) {
         let idx = Self::reg_index(addr);
-        self.regs[idx] = value & !READ_MASKS[idx];
+        self.regs[idx] = value;
     }
 
     fn write_powered(&mut self, addr: u16, value: u8) {
@@ -553,7 +562,7 @@ impl Apu {
         self.sweep.period = (nr10 >> 4) & 0x07;
         self.sweep.shift = nr10 & 0x07;
         self.sweep.negate = nr10 & 0x08 != 0;
-        self.sweep.timer = self.sweep.period.max(1);
+        self.sweep.timer = sweep_period(self.sweep.period);
         self.sweep.shadow_freq = self.square_freq(
             self.regs[Self::reg_index(NR13)],
             self.regs[Self::reg_index(NR14)],
@@ -572,7 +581,7 @@ impl Apu {
         self.ch3.period_timer = Self::wave_period(
             self.regs[Self::reg_index(NR33)],
             self.regs[Self::reg_index(NR34)],
-        );
+        ) + WAVE_TRIGGER_DELAY_T;
     }
 
     fn clock_sweep(&mut self) {
@@ -583,7 +592,7 @@ impl Apu {
             return;
         }
 
-        self.sweep.timer = self.sweep.period.max(1);
+        self.sweep.timer = sweep_period(self.sweep.period);
         if !self.sweep.enabled || self.sweep.period == 0 {
             return;
         }
@@ -869,6 +878,9 @@ mod tests {
             apu.regs[Apu::reg_index(NR33)],
             apu.regs[Apu::reg_index(NR34)],
         );
+        for _ in 0..WAVE_TRIGGER_DELAY_T {
+            apu.tick(1);
+        }
         for _ in 0..period {
             apu.tick(1);
         }
@@ -900,5 +912,26 @@ mod tests {
         }
 
         assert_eq!(batched.drain_samples(), stepped.drain_samples());
+    }
+
+    #[test]
+    fn sweep_period_zero_reloads_as_eight() {
+        assert_eq!(sweep_period(0), 8);
+        assert_eq!(sweep_period(5), 5);
+    }
+
+    #[test]
+    fn write_only_frequency_bits_are_preserved_internally() {
+        let mut apu = Apu::new();
+        apu.write(NR52, 0x80);
+        apu.write(NR13, 0xaa);
+        apu.write(NR14, 0x87);
+        apu.write(NR33, 0x55);
+        apu.write(NR34, 0x83);
+
+        assert_eq!(apu.regs[Apu::reg_index(NR13)], 0xaa);
+        assert_eq!(apu.regs[Apu::reg_index(NR14)] & 0x07, 0x07);
+        assert_eq!(apu.regs[Apu::reg_index(NR33)], 0x55);
+        assert_eq!(apu.regs[Apu::reg_index(NR34)] & 0x07, 0x03);
     }
 }
