@@ -336,7 +336,18 @@ impl Apu {
 
     fn write_powered(&mut self, addr: u16, value: u8) {
         match addr {
-            NR10 | NR50 | NR51 => self.write_reg_raw(addr, value),
+            NR10 => {
+                let old_negate = self.regs[Self::reg_index(NR10)] & 0x08 != 0;
+                self.write_reg_raw(addr, value);
+                let new_negate = value & 0x08 != 0;
+                if old_negate && !new_negate && self.sweep.negate_used {
+                    self.ch1.enabled = false;
+                }
+                self.sweep.negate = new_negate;
+                self.sweep.period = (value >> 4) & 0x07;
+                self.sweep.shift = value & 0x07;
+            }
+            NR50 | NR51 => self.write_reg_raw(addr, value),
             NR11 => {
                 self.write_reg_raw(addr, value);
                 self.ch1.load_length(value, 0x3f);
@@ -483,13 +494,9 @@ impl Apu {
         );
         let mut remaining = u16::from(cycles);
         while remaining > 0 {
-            if self.ch3.period_timer == 0 {
-                self.ch3.period_timer = period;
-            }
-            let step = remaining.min(self.ch3.period_timer);
-            self.ch3.period_timer -= step;
-            remaining -= step;
-            if self.ch3.period_timer == 0 {
+            if remaining > self.ch3.period_timer {
+                remaining -= self.ch3.period_timer + 1;
+                self.ch3.period_timer = period.saturating_sub(1);
                 self.wave_index = (self.wave_index + 1) & 0x1f;
                 self.wave_byte = self.wave_ram[(self.wave_index >> 1) as usize];
                 self.wave_output = if self.wave_index & 1 == 0 {
@@ -498,6 +505,9 @@ impl Apu {
                     self.wave_byte & 0x0f
                 };
                 self.ch3.phase = self.wave_index;
+            } else {
+                self.ch3.period_timer -= remaining;
+                remaining = 0;
             }
         }
     }
@@ -562,6 +572,7 @@ impl Apu {
         self.sweep.period = (nr10 >> 4) & 0x07;
         self.sweep.shift = nr10 & 0x07;
         self.sweep.negate = nr10 & 0x08 != 0;
+        self.sweep.negate_used = false;
         self.sweep.timer = sweep_period(self.sweep.period);
         self.sweep.shadow_freq = self.square_freq(
             self.regs[Self::reg_index(NR13)],
@@ -881,11 +892,11 @@ mod tests {
         for _ in 0..WAVE_TRIGGER_DELAY_T {
             apu.tick(1);
         }
-        for _ in 0..period {
+        for _ in 0..=period {
             apu.tick(1);
         }
         assert_eq!(apu.wave_output, 0x01);
-        for _ in 0..period {
+        for _ in 0..=period {
             apu.tick(1);
         }
         assert_eq!(apu.wave_output, 0x02);
@@ -918,6 +929,26 @@ mod tests {
     fn sweep_period_zero_reloads_as_eight() {
         assert_eq!(sweep_period(0), 8);
         assert_eq!(sweep_period(5), 5);
+    }
+
+    #[test]
+    fn clearing_negate_after_negate_sweep_use_disables_channel1() {
+        let mut apu = Apu::new();
+        apu.write(NR52, 0x80);
+        apu.write(NR12, 0xf0);
+        apu.write(NR10, 0x19);
+        apu.write(NR13, 0x40);
+        apu.write(NR14, 0x83);
+        assert_ne!(apu.read(NR52) & 0x01, 0);
+
+        // Force a sweep calculation to observe negate mode once.
+        apu.sweep.shadow_freq = 0x140;
+        let _ = apu.calculate_sweep_frequency(true);
+        assert!(apu.sweep.negate_used);
+
+        apu.write(NR10, 0x11);
+
+        assert_eq!(apu.read(NR52) & 0x01, 0);
     }
 
     #[test]

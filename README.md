@@ -12,13 +12,13 @@ Rust is used not to hide the machine, but to make its boundaries visible and tes
 AI writes.  
 Rust reduces the review surface.
 
-Status: **work in progress.** Core CPU execution, memory, MMU, and basic cartridge support are in place.
+Status: **work in progress.** CPU, MMU, PPU, timer, serial, and joypad run on DMG-accurate timing. The APU is landing now.
 
 ## Philosophy
 
 Formula is built from explicit boundaries.
 
-The CPU does not own the world.
+The CPU does not own the world.  
 It fetches bytes, mutates registers, and talks to memory through the bus.
 
 Memory is bytes.  
@@ -38,40 +38,29 @@ The current core is organized around this shape:
 CPU -> MMU -> Cartridge / Memory / I/O
 ```
 
-The emulator begins from the CPU core and grows outward:
-
-```
-CPU
-Memory
-MMU
-Cartridge
-Timer
-Interrupts
-PPU
-Input
-```
-
 ## Current Status
 
 Implemented:
 
-- core CPU execution
-- register state
-- instruction fetch
-- memory
-- MMU
-- basic cartridge support
-- unit tests for core behavior
+- full CPU instruction set, including HALT, STOP, and the DMG OAM-bug edge cases
+- interrupt dispatch with IME/IE/IF and the post-push vector resolve
+- MMU with per-M-cycle subsystem ticking
+- cartridge support for MBC0 and MBC1
+- timer with DMG-accurate overflow timing
+- serial port on real DMG timing
+- joypad register wired through to IF bit 4
+- PPU: BG, window, and sprite layers with priorities, palettes, flips, 8x16, OAM DMA — passes `dmg-acid2`
+- integration suite covering the CPU, PPU, timer, serial, and OAM-bug behaviors
+
+In progress (on `impl-apu`):
+
+- APU: NR10–NR52 register file, frame sequencer, length counters, envelope, sweep, wave channel, mixed output through `aplay`
 
 Not yet complete:
 
-- full instruction set
-- interrupts
-- timer
-- PPU
-- joypad input
-- sound
-- cycle-accurate behavior
+- additional MBCs (MBC2/3/5, RTC, battery-backed save)
+- full cycle accuracy across every subsystem
+- Game Boy Color features
 
 ## Development shell
 
