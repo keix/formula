@@ -254,6 +254,7 @@ impl Bus for Mmu {
             0xff00 => self.joypad.read(addr),
             0xff01..=0xff02 => self.serial.read(addr),
             0xff04..=0xff07 => self.timer.read(addr),
+            0xff0f => self.io[0x0f] | 0xe0,
             0xff46 => self.dma,
             0xff40..=0xff4b => self.ppu.read(addr),
             0xff00..=0xff7f => self.io[(addr - 0xff00) as usize],
@@ -275,6 +276,7 @@ impl Bus for Mmu {
             0xff00 => self.joypad.write(addr, value),
             0xff01..=0xff02 => self.serial.write(addr, value),
             0xff04..=0xff07 => self.timer.write(addr, value),
+            0xff0f => self.io[0x0f] = value | 0xe0,
             0xff46 => self.start_oam_dma(value),
             0xff40..=0xff4b => self.ppu.write(addr, value),
             0xff00..=0xff7f => self.io[(addr - 0xff00) as usize] = value,
@@ -565,6 +567,26 @@ mod tests {
 
         // Both VBlank (bit 0) and Timer (bit 2) should be set
         assert_eq!(mmu.read8(0xff0f) & 0x05, 0x05);
+    }
+
+    #[test]
+    fn if_register_reads_back_with_upper_bits_set() {
+        let mut mmu = make_mmu();
+
+        mmu.write8(0xff0f, 0x01);
+
+        assert_eq!(mmu.read8(0xff0f), 0xe1);
+    }
+
+    #[test]
+    fn if_register_write_preserves_upper_bits_and_lower_payload() {
+        let mut mmu = make_mmu();
+
+        mmu.write8(0xff0f, 0x00);
+        assert_eq!(mmu.read8(0xff0f), 0xe0);
+
+        mmu.write8(0xff0f, 0x1f);
+        assert_eq!(mmu.read8(0xff0f), 0xff);
     }
 
     #[test]

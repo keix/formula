@@ -571,19 +571,35 @@ impl Cpu {
         }
     }
 
-    fn service_interrupt(&mut self, bus: &mut impl Bus, pending: u8) -> u8 {
-        let bit = pending.trailing_zeros() as u8;
-        let vector = 0x40_u16 + u16::from(bit) * 8;
-
+    fn service_interrupt(&mut self, bus: &mut impl Bus, _pending: u8) -> u8 {
         self.ime = false;
-        let if_ = bus.read8(0xff0f);
-        bus.write8(0xff0f, if_ & !(1u8 << bit));
 
         self.idle(bus);
         self.idle(bus);
         self.idle(bus);
-        self.push16(bus, self.pc);
-        self.pc = vector;
+
+        let [hi, lo] = self.pc.to_be_bytes();
+        let idu_addr = self.sp;
+        self.sp = self.sp.wrapping_sub(1);
+        self.write8_timed_idu(bus, self.sp, hi, idu_addr);
+
+        // Real hardware chooses and acknowledges the interrupt only after the
+        // stack writes have run, so SP aliasing IE/IF can change the vector.
+        let mut pending = bus.read8(0xffff) & 0x1f;
+        let idu_addr = self.sp;
+        self.sp = self.sp.wrapping_sub(1);
+        self.write8_timed_idu(bus, self.sp, lo, idu_addr);
+        pending &= bus.read8(0xff0f) & 0x1f;
+
+        if pending != 0 {
+            let bit = pending.trailing_zeros() as u8;
+            let vector = 0x40_u16 + u16::from(bit) * 8;
+            let if_ = bus.read8(0xff0f);
+            bus.write8(0xff0f, if_ & !(1u8 << bit));
+            self.pc = vector;
+        } else {
+            self.pc = 0x0000;
+        }
 
         20
     }
@@ -1164,6 +1180,39 @@ mod tests {
         }
     }
 
+    struct HaltWakeBus {
+        mem: Memory,
+        ticks: u32,
+        wake_at: u32,
+    }
+
+    impl HaltWakeBus {
+        fn new(wake_at: u32) -> Self {
+            Self {
+                mem: Memory::new(),
+                ticks: 0,
+                wake_at,
+            }
+        }
+    }
+
+    impl Bus for HaltWakeBus {
+        fn read8(&self, addr: u16) -> u8 {
+            match addr {
+                0xff0f if self.ticks >= self.wake_at => 0x01,
+                _ => self.mem.read8(addr),
+            }
+        }
+
+        fn write8(&mut self, addr: u16, value: u8) {
+            self.mem.write8(addr, value);
+        }
+
+        fn tick(&mut self, cycles: u8) {
+            self.ticks += u32::from(cycles);
+        }
+    }
+
     impl Bus for TimingBus {
         fn read8(&self, addr: u16) -> u8 {
             match addr {
@@ -1252,6 +1301,46 @@ mod tests {
         let cycles = cpu.step(&mut mem);
         assert_eq!(cpu.pc, pc);
         assert_eq!(cycles, 4);
+    }
+
+    #[test]
+    fn first_halt_iteration_does_not_midcycle_wake() {
+        let mut cpu = Cpu::new();
+        let mut bus = HaltWakeBus::new(2);
+        cpu.pc = 0x1000;
+        cpu.halted = true;
+        cpu.just_halted = true;
+        bus.write8(0x1000, 0x00); // NOP once we do wake
+        bus.write8(0xffff, 0x01);
+
+        let cycles = cpu.step(&mut bus);
+
+        assert_eq!(cycles, 4);
+        assert!(cpu.halted, "the first halted iteration should ignore the 2T wake edge");
+        assert_eq!(cpu.pc, 0x1000);
+        assert_eq!(bus.ticks, 4);
+    }
+
+    #[test]
+    fn halted_cpu_wakes_midcycle_on_later_iterations() {
+        let mut cpu = Cpu::new();
+        let mut bus = HaltWakeBus::new(2);
+        cpu.pc = 0x1000;
+        cpu.halted = true;
+        cpu.just_halted = false;
+        bus.write8(0x1000, 0x00); // NOP once we wake
+        bus.write8(0xffff, 0x01);
+
+        let cycles = cpu.step(&mut bus);
+
+        assert_eq!(cycles, 4);
+        assert!(!cpu.halted, "later halted iterations should wake on the 2T boundary");
+        assert_eq!(cpu.pc, 0x1000, "wake happens during the idle cycle, before executing the next opcode");
+        assert_eq!(bus.ticks, 4);
+
+        let next_cycles = cpu.step(&mut bus);
+        assert_eq!(next_cycles, 4);
+        assert_eq!(cpu.pc, 0x1001);
     }
 
     #[test]
@@ -1902,6 +1991,26 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_vector_is_resolved_after_stack_push_side_effects() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.pc = 0x1234;
+        cpu.sp = 0xff11;
+        cpu.ime = true;
+        mem.write8(0xff0f, 0x01); // VBlank pending
+        mem.write8(0xffff, 0x01); // VBlank enabled
+
+        let cycles = cpu.step(&mut mem);
+
+        assert_eq!(cycles, 20);
+        assert_eq!(cpu.sp, 0xff0f);
+        assert_eq!(mem.read8(0xff10), 0x12); // high byte landed first
+        assert_eq!(mem.read8(0xff0f), 0x34); // low byte overwrote IF before ack
+        assert_eq!(cpu.pc, 0x0000); // pending vanished, so the CPU vectors to 0
+        assert!(!cpu.ime);
+    }
+
+    #[test]
     fn interrupt_not_serviced_when_ime_disabled() {
         let mut cpu = Cpu::new();
         let mut mem = Memory::new();
@@ -1976,6 +2085,36 @@ mod tests {
             cpu.ime,
             "IME should be set after the instruction following EI"
         );
+    }
+
+    #[test]
+    fn ei_then_halt_enables_ime_after_halt_and_services_future_interrupt() {
+        let mut cpu = Cpu::new();
+        let mut mem = Memory::new();
+        cpu.pc = 0x1000;
+        cpu.sp = 0xfffe;
+        mem.write8(0x1000, 0xfb); // EI
+        mem.write8(0x1001, 0x76); // HALT
+
+        let ei_cycles = cpu.step(&mut mem);
+        assert_eq!(ei_cycles, 4);
+        assert!(!cpu.ime, "EI must not enable IME immediately");
+
+        let halt_cycles = cpu.step(&mut mem);
+        assert_eq!(halt_cycles, 4);
+        assert!(cpu.ime, "EI delay matures after HALT completes");
+        assert!(cpu.halted, "HALT should still enter the halted state with no pending IRQ");
+        assert_eq!(cpu.pc, 0x1002);
+
+        mem.write8(0xff0f, 0x01);
+        mem.write8(0xffff, 0x01);
+
+        let irq_cycles = cpu.step(&mut mem);
+        assert_eq!(irq_cycles, 20);
+        assert_eq!(cpu.pc, 0x0040);
+        assert_eq!(cpu.sp, 0xfffc);
+        assert_eq!(mem.read8(0xfffc), 0x02);
+        assert_eq!(mem.read8(0xfffd), 0x10);
     }
 
     #[test]
