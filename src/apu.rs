@@ -48,6 +48,7 @@ const FRAME_SEQ_PERIOD_T: u16 = 8192;
 const CPU_CLOCK_HZ: u32 = 4_194_304;
 const OUTPUT_SAMPLE_RATE: u32 = 48_000;
 const DC_BLOCK_COEFF: f32 = 0.996;
+const LOW_PASS_COEFF: f32 = 0.82;
 const DUTY_PATTERNS: [u8; 4] = [0b0000_0001, 0b1000_0001, 0b1000_0111, 0b0111_1110];
 const NOISE_DIVISORS: [u16; 8] = [8, 16, 32, 48, 64, 80, 96, 112];
 
@@ -172,12 +173,17 @@ pub struct Apu {
     ch3: Channel,
     ch4: Channel,
     sweep: SweepState,
+    wave_index: u8,
+    wave_byte: u8,
+    wave_output: u8,
     sample_phase: u32,
     sample_buffer: Vec<i16>,
     hp_prev_in_l: f32,
     hp_prev_in_r: f32,
     hp_prev_out_l: f32,
     hp_prev_out_r: f32,
+    lp_prev_l: f32,
+    lp_prev_r: f32,
 }
 
 impl Apu {
@@ -193,12 +199,17 @@ impl Apu {
             ch3: Channel::new(256),
             ch4: Channel::new(64),
             sweep: SweepState::new(),
+            wave_index: 0,
+            wave_byte: 0,
+            wave_output: 0,
             sample_phase: 0,
             sample_buffer: Vec::new(),
             hp_prev_in_l: 0.0,
             hp_prev_in_r: 0.0,
             hp_prev_out_l: 0.0,
             hp_prev_out_r: 0.0,
+            lp_prev_l: 0.0,
+            lp_prev_r: 0.0,
         }
     }
 
@@ -252,20 +263,22 @@ impl Apu {
             return;
         }
 
-        self.advance_channels(cycles);
+        for _ in 0..cycles {
+            self.advance_channels(1);
 
-        self.frame_seq_div += u16::from(cycles);
-        while self.frame_seq_div >= FRAME_SEQ_PERIOD_T {
-            self.frame_seq_div -= FRAME_SEQ_PERIOD_T;
-            self.clock_frame_sequencer();
-        }
+            self.frame_seq_div += 1;
+            if self.frame_seq_div >= FRAME_SEQ_PERIOD_T {
+                self.frame_seq_div -= FRAME_SEQ_PERIOD_T;
+                self.clock_frame_sequencer();
+            }
 
-        self.sample_phase += u32::from(cycles) * OUTPUT_SAMPLE_RATE;
-        while self.sample_phase >= CPU_CLOCK_HZ {
-            self.sample_phase -= CPU_CLOCK_HZ;
-            let (left, right) = self.render_sample();
-            self.sample_buffer.push(left);
-            self.sample_buffer.push(right);
+            self.sample_phase += OUTPUT_SAMPLE_RATE;
+            while self.sample_phase >= CPU_CLOCK_HZ {
+                self.sample_phase -= CPU_CLOCK_HZ;
+                let (left, right) = self.render_sample();
+                self.sample_buffer.push(left);
+                self.sample_buffer.push(right);
+            }
         }
     }
 
@@ -287,11 +300,16 @@ impl Apu {
         self.ch3 = Channel::new(256);
         self.ch4 = Channel::new(64);
         self.sweep = SweepState::new();
+        self.wave_index = 0;
+        self.wave_byte = 0;
+        self.wave_output = 0;
         self.sample_phase = 0;
         self.hp_prev_in_l = 0.0;
         self.hp_prev_in_r = 0.0;
         self.hp_prev_out_l = 0.0;
         self.hp_prev_out_r = 0.0;
+        self.lp_prev_l = 0.0;
+        self.lp_prev_r = 0.0;
     }
 
     fn power_on(&mut self) {
@@ -362,6 +380,7 @@ impl Apu {
                 self.ch3.dac_enabled = value & 0x80 != 0;
                 if !self.ch3.dac_enabled {
                     self.ch3.enabled = false;
+                    self.wave_output = 0;
                 }
             }
             NR31 => {
@@ -373,6 +392,7 @@ impl Apu {
                 self.ch3.length_enabled = value & 0x40 != 0;
                 if value & 0x80 != 0 {
                     self.ch3.trigger();
+                    self.trigger_wave();
                 }
             }
             NR41 => {
@@ -452,7 +472,25 @@ impl Apu {
             self.regs[Self::reg_index(NR33)],
             self.regs[Self::reg_index(NR34)],
         );
-        Self::advance_periodic_channel(&mut self.ch3, cycles, period);
+        let mut remaining = u16::from(cycles);
+        while remaining > 0 {
+            if self.ch3.period_timer == 0 {
+                self.ch3.period_timer = period;
+            }
+            let step = remaining.min(self.ch3.period_timer);
+            self.ch3.period_timer -= step;
+            remaining -= step;
+            if self.ch3.period_timer == 0 {
+                self.wave_index = (self.wave_index + 1) & 0x1f;
+                self.wave_byte = self.wave_ram[(self.wave_index >> 1) as usize];
+                self.wave_output = if self.wave_index & 1 == 0 {
+                    self.wave_byte >> 4
+                } else {
+                    self.wave_byte & 0x0f
+                };
+                self.ch3.phase = self.wave_index;
+            }
+        }
     }
 
     fn advance_noise(&mut self, cycles: u8) {
@@ -524,6 +562,17 @@ impl Apu {
         if self.sweep.shift != 0 {
             let _ = self.calculate_sweep_frequency(false);
         }
+    }
+
+    fn trigger_wave(&mut self) {
+        self.wave_index = 0;
+        self.wave_byte = self.wave_ram[0];
+        self.wave_output = self.wave_byte >> 4;
+        self.ch3.phase = 0;
+        self.ch3.period_timer = Self::wave_period(
+            self.regs[Self::reg_index(NR33)],
+            self.regs[Self::reg_index(NR34)],
+        );
     }
 
     fn clock_sweep(&mut self) {
@@ -601,14 +650,26 @@ impl Apu {
             }
         }
 
-        let left = left * (left_volume as f32 / 8.0) / 5.0;
-        let right = right * (right_volume as f32 / 8.0) / 5.0;
+        let left = left * (left_volume as f32 / 8.0) / 4.5;
+        let right = right * (right_volume as f32 / 8.0) / 4.5;
+        let left = self.low_pass_left(left);
+        let right = self.low_pass_right(right);
         let left = self.high_pass_left(left).clamp(-1.0, 1.0);
         let right = self.high_pass_right(right).clamp(-1.0, 1.0);
         (
             (left * i16::MAX as f32) as i16,
             (right * i16::MAX as f32) as i16,
         )
+    }
+
+    fn low_pass_left(&mut self, input: f32) -> f32 {
+        self.lp_prev_l += LOW_PASS_COEFF * (input - self.lp_prev_l);
+        self.lp_prev_l
+    }
+
+    fn low_pass_right(&mut self, input: f32) -> f32 {
+        self.lp_prev_r += LOW_PASS_COEFF * (input - self.lp_prev_r);
+        self.lp_prev_r
     }
 
     fn high_pass_left(&mut self, input: f32) -> f32 {
@@ -631,8 +692,11 @@ impl Apu {
         }
         let duty = DUTY_PATTERNS[((duty_reg >> 6) & 0x03) as usize];
         let high = (duty >> (7 - (ch.phase & 0x07))) & 0x01 != 0;
-        let amp = if high { 1.0 } else { -1.0 };
-        amp * (ch.volume as f32 / 15.0)
+        if high {
+            ch.volume as f32 / 15.0
+        } else {
+            0.0
+        }
     }
 
     fn wave_sample(&self) -> f32 {
@@ -645,28 +709,24 @@ impl Apu {
             return 0.0;
         }
 
-        let sample_index = (self.ch3.phase & 0x1f) as usize;
-        let byte = self.wave_ram[sample_index / 2];
-        let nibble = if sample_index & 1 == 0 {
-            byte >> 4
-        } else {
-            byte & 0x0f
+        let level_scale = match level_code {
+            1 => 1.0,
+            2 => 0.5,
+            3 => 0.25,
+            _ => 0.0,
         };
-        let shifted = match level_code {
-            1 => nibble,
-            2 => nibble >> 1,
-            3 => nibble >> 2,
-            _ => 0,
-        };
-        (shifted as f32 / 7.5) - 1.0
+        (self.wave_output as f32 / 15.0) * level_scale
     }
 
     fn noise_sample(&self) -> f32 {
         if !self.ch4.enabled || !self.ch4.dac_enabled || self.ch4.volume == 0 {
             return 0.0;
         }
-        let amp = if self.ch4.lfsr & 0x01 == 0 { 1.0 } else { -1.0 };
-        amp * (self.ch4.volume as f32 / 15.0)
+        if self.ch4.lfsr & 0x01 == 0 {
+            self.ch4.volume as f32 / 15.0
+        } else {
+            0.0
+        }
     }
 }
 
@@ -791,5 +851,54 @@ mod tests {
             }
         }
         assert_eq!(apu.ch1.volume, 4);
+    }
+
+    #[test]
+    fn wave_channel_latches_samples_as_it_advances() {
+        let mut apu = Apu::new();
+        apu.write(NR52, 0x80);
+        apu.write(NR30, 0x80);
+        apu.write(NR32, 0x20);
+        apu.write(0xff30, 0xf1);
+        apu.write(0xff31, 0x23);
+        apu.write(NR33, 0xff);
+        apu.write(NR34, 0x87);
+
+        assert_eq!(apu.wave_output, 0x0f);
+        let period = Apu::wave_period(
+            apu.regs[Apu::reg_index(NR33)],
+            apu.regs[Apu::reg_index(NR34)],
+        );
+        for _ in 0..period {
+            apu.tick(1);
+        }
+        assert_eq!(apu.wave_output, 0x01);
+        for _ in 0..period {
+            apu.tick(1);
+        }
+        assert_eq!(apu.wave_output, 0x02);
+    }
+
+    #[test]
+    fn batched_tick_matches_single_cycle_tick_for_audio_sampling() {
+        let mut batched = Apu::new();
+        let mut stepped = Apu::new();
+
+        for apu in [&mut batched, &mut stepped] {
+            apu.write(NR52, 0x80);
+            apu.write(NR50, 0x77);
+            apu.write(NR51, 0x11);
+            apu.write(NR12, 0xf0);
+            apu.write(NR11, 0x80);
+            apu.write(NR13, 0xaa);
+            apu.write(NR14, 0x87);
+        }
+
+        batched.tick(16);
+        for _ in 0..16 {
+            stepped.tick(1);
+        }
+
+        assert_eq!(batched.drain_samples(), stepped.drain_samples());
     }
 }
