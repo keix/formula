@@ -116,7 +116,8 @@ impl Timer {
             let old_counter = self.counter;
             self.counter = self.counter.wrapping_add(1);
 
-            if Self::timer_input(old_counter, self.tac) && !Self::timer_input(self.counter, self.tac)
+            if Self::timer_input(old_counter, self.tac)
+                && !Self::timer_input(self.counter, self.tac)
             {
                 self.increment_tima();
             }

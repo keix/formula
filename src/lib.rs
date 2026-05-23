@@ -7,6 +7,7 @@
 //! narrow API the MMU dispatches to. The binary at `src/main.rs` wires
 //! this library to a minifb window and the host keyboard.
 
+pub mod apu;
 pub mod bus;
 pub mod cartridge;
 pub mod cpu;

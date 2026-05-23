@@ -1316,7 +1316,10 @@ mod tests {
         let cycles = cpu.step(&mut bus);
 
         assert_eq!(cycles, 4);
-        assert!(cpu.halted, "the first halted iteration should ignore the 2T wake edge");
+        assert!(
+            cpu.halted,
+            "the first halted iteration should ignore the 2T wake edge"
+        );
         assert_eq!(cpu.pc, 0x1000);
         assert_eq!(bus.ticks, 4);
     }
@@ -1334,8 +1337,14 @@ mod tests {
         let cycles = cpu.step(&mut bus);
 
         assert_eq!(cycles, 4);
-        assert!(!cpu.halted, "later halted iterations should wake on the 2T boundary");
-        assert_eq!(cpu.pc, 0x1000, "wake happens during the idle cycle, before executing the next opcode");
+        assert!(
+            !cpu.halted,
+            "later halted iterations should wake on the 2T boundary"
+        );
+        assert_eq!(
+            cpu.pc, 0x1000,
+            "wake happens during the idle cycle, before executing the next opcode"
+        );
         assert_eq!(bus.ticks, 4);
 
         let next_cycles = cpu.step(&mut bus);
@@ -2103,7 +2112,10 @@ mod tests {
         let halt_cycles = cpu.step(&mut mem);
         assert_eq!(halt_cycles, 4);
         assert!(cpu.ime, "EI delay matures after HALT completes");
-        assert!(cpu.halted, "HALT should still enter the halted state with no pending IRQ");
+        assert!(
+            cpu.halted,
+            "HALT should still enter the halted state with no pending IRQ"
+        );
         assert_eq!(cpu.pc, 0x1002);
 
         mem.write8(0xff0f, 0x01);

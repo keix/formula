@@ -3,9 +3,9 @@
 //! Implements [`Bus`] for the full 16-bit GB address space and routes
 //! each region to the subsystem that owns it: cartridge for ROM/ext
 //! RAM, PPU for VRAM/OAM and the LCD register window, Serial for
-//! 0xFF01/02, Timer for 0xFF04-07, Joypad for 0xFF00, and a private
-//! `io[]` byte array for the unmapped IO bytes the cartridge sees but
-//! we don't model (sound, mostly). `tick(cycles)` fans the cycle
+//! 0xFF01/02, Timer for 0xFF04-07, Joypad for 0xFF00, APU for
+//! 0xFF10-0xFF3F, and a private `io[]` byte array for the remaining
+//! unmapped IO bytes. `tick(cycles)` fans the cycle
 //! budget out to every subsystem and folds their IRQ requests back
 //! into IF (0xFF0F).
 //!
@@ -19,6 +19,7 @@
 //!   specific arms above it carve out the routed sub-addresses, with
 //!   clippy::match_overlapping_arm silenced where that's load-bearing.
 
+use crate::apu::Apu;
 use crate::bus::Bus;
 use crate::cartridge::Cartridge;
 use crate::joypad::Joypad;
@@ -32,6 +33,7 @@ pub struct Mmu {
     ppu: Ppu,
     serial: Serial,
     joypad: Joypad,
+    apu: Apu,
     wram: [u8; 0x2000],
     io: [u8; 0x80],
     hram: [u8; 0x7f],
@@ -64,6 +66,7 @@ impl Mmu {
             ppu: Ppu::new(),
             serial: Serial::new(),
             joypad: Joypad::new(),
+            apu: Apu::new(),
             wram: [0; 0x2000],
             io: [0; 0x80],
             hram: [0; 0x7f],
@@ -211,6 +214,7 @@ impl Mmu {
         if self.serial.tick(cycles) {
             self.io[0x0f] |= 0x08; // Serial interrupt -> IF bit 3
         }
+        self.apu.tick(cycles);
     }
 
     /// Consume any bytes that the CPU has shipped out via the serial port
@@ -229,6 +233,14 @@ impl Mmu {
     /// reaching through the MMU into the PPU directly.
     pub fn framebuffer(&self) -> &Framebuffer {
         self.ppu.framebuffer()
+    }
+
+    pub fn audio_sample_rate(&self) -> u32 {
+        self.apu.sample_rate()
+    }
+
+    pub fn drain_audio_samples(&mut self) -> Vec<i16> {
+        self.apu.drain_samples()
     }
 
     fn write8_cpu_impl(&mut self, addr: u16, value: u8) {
@@ -255,6 +267,7 @@ impl Bus for Mmu {
             0xff01..=0xff02 => self.serial.read(addr),
             0xff04..=0xff07 => self.timer.read(addr),
             0xff0f => self.io[0x0f] | 0xe0,
+            0xff10..=0xff3f => self.apu.read(addr),
             0xff46 => self.dma,
             0xff40..=0xff4b => self.ppu.read(addr),
             0xff00..=0xff7f => self.io[(addr - 0xff00) as usize],
@@ -277,6 +290,7 @@ impl Bus for Mmu {
             0xff01..=0xff02 => self.serial.write(addr, value),
             0xff04..=0xff07 => self.timer.write(addr, value),
             0xff0f => self.io[0x0f] = value | 0xe0,
+            0xff10..=0xff3f => self.apu.write(addr, value),
             0xff46 => self.start_oam_dma(value),
             0xff40..=0xff4b => self.ppu.write(addr, value),
             0xff00..=0xff7f => self.io[(addr - 0xff00) as usize] = value,
@@ -485,17 +499,33 @@ mod tests {
     #[test]
     fn io_area_roundtrip() {
         // 0xFF00 (joypad) and 0xFF46 (DMA) bypass the generic io[] array;
-        // they each have dedicated tests above. The other unmapped IO
+        // 0xFF10-0xFF3F route to APU and have dedicated tests. The other unmapped IO
         // bytes still round-trip through the array.
         let mut mmu = make_mmu();
 
         mmu.write8(0xff03, 0xab);
-        mmu.write8(0xff40, 0x91);
+        mmu.write8(0xff0e, 0x91);
         mmu.write8(0xff7f, 0xcd);
 
         assert_eq!(mmu.read8(0xff03), 0xab);
-        assert_eq!(mmu.read8(0xff40), 0x91);
+        assert_eq!(mmu.read8(0xff0e), 0x91);
         assert_eq!(mmu.read8(0xff7f), 0xcd);
+    }
+
+    #[test]
+    fn apu_register_window_routes_to_apu_instead_of_generic_io() {
+        let mut mmu = make_mmu();
+
+        mmu.write8(0xff12, 0xff); // ignored while APU is off
+        assert_eq!(mmu.read8(0xff12), 0x00);
+
+        mmu.write8(0xff26, 0x80); // power on
+        mmu.write8(0xff12, 0x56);
+        mmu.write8(0xff30, 0x9a);
+
+        assert_eq!(mmu.read8(0xff12), 0x56);
+        assert_eq!(mmu.read8(0xff26), 0xf0);
+        assert_eq!(mmu.read8(0xff30), 0x9a);
     }
 
     #[test]
