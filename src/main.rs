@@ -26,11 +26,15 @@ use minifb::{Key, KeyRepeat, Scale, Window, WindowOptions};
 use std::env;
 use std::io::Write;
 use std::process::{Child, ChildStdin, Command, ExitCode, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 // Safety net so a runaway ROM eventually returns control instead of hanging
 // the terminal. Generous enough for Blargg's cpu_instrs to finish even
 // without the spin-loop terminator below.
 const MAX_CYCLES: u64 = 2_000_000_000;
+const AUDIO_BATCH_SAMPLES: usize = 2048;
+const GB_FRAME_DURATION: Duration = Duration::from_nanos(16_742_706);
 
 // DMG-style green palette, lightest -> darkest.
 const PALETTE: [u32; 4] = [0x9bbc0f, 0x8bac0f, 0x306230, 0x0f380f];
@@ -38,6 +42,7 @@ const PALETTE: [u32; 4] = [0x9bbc0f, 0x8bac0f, 0x306230, 0x0f380f];
 struct AudioSink {
     _child: Child,
     stdin: ChildStdin,
+    pending: Vec<i16>,
 }
 
 impl AudioSink {
@@ -63,19 +68,37 @@ impl AudioSink {
         Some(Self {
             _child: child,
             stdin,
+            pending: Vec::with_capacity(AUDIO_BATCH_SAMPLES * 2),
         })
     }
 
-    fn write_samples(&mut self, samples: &[i16]) {
+    fn queue_samples(&mut self, samples: &[i16]) {
         if samples.is_empty() {
             return;
         }
 
-        let mut bytes = Vec::with_capacity(samples.len() * 2);
-        for sample in samples {
+        self.pending.extend_from_slice(samples);
+        if self.pending.len() >= AUDIO_BATCH_SAMPLES {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+
+        let mut bytes = Vec::with_capacity(self.pending.len() * 2);
+        for sample in self.pending.drain(..) {
             bytes.extend_from_slice(&sample.to_le_bytes());
         }
         let _ = self.stdin.write_all(&bytes);
+    }
+}
+
+impl Drop for AudioSink {
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 
@@ -126,9 +149,10 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    // Block update_with_buffer to ~60 Hz so the emulator paces itself
-    // close to GB frame rate (one update per VBlank).
-    window.set_target_fps(60);
+    // Pace explicitly to the DMG's real frame cadence instead of a coarse
+    // 60.0 Hz host approximation. 70224 T-cycles at 4_194_304 Hz is
+    // ~16.742706 ms per frame (~59.7275 Hz).
+    window.set_target_fps(0);
 
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
@@ -137,6 +161,7 @@ fn main() -> ExitCode {
     let mut total_cycles: u64 = 0;
     let mut parked = false;
     let mut same_pc_count: u32 = 0;
+    let mut next_frame_deadline = Instant::now();
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         if parked || cpu.locked || total_cycles >= MAX_CYCLES {
@@ -158,13 +183,24 @@ fn main() -> ExitCode {
         }
         if let Some(audio) = audio.as_mut() {
             let samples = mmu.drain_audio_samples();
-            audio.write_samples(&samples);
+            audio.queue_samples(&samples);
         }
 
         if mmu.take_frame_ready() {
+            let now = Instant::now();
+            if now < next_frame_deadline {
+                thread::sleep(next_frame_deadline - now);
+            } else if now.duration_since(next_frame_deadline) > GB_FRAME_DURATION {
+                next_frame_deadline = now;
+            }
+            next_frame_deadline += GB_FRAME_DURATION;
+
             blit_framebuffer(&mut pixel_buffer, mmu.framebuffer().as_slice());
             let _ = window.update_with_buffer(&pixel_buffer, WIDTH, HEIGHT);
             mmu.set_buttons(read_joypad(&window));
+            if let Some(audio) = audio.as_mut() {
+                audio.flush();
+            }
 
             // Press D to snapshot OAM + the palette / LCDC registers to
             // stderr. Useful when sprites are visibly missing — proves

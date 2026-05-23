@@ -47,6 +47,7 @@ const READ_MASKS: [u8; (REG_END - REG_START + 1) as usize] = [
 const FRAME_SEQ_PERIOD_T: u16 = 8192;
 const CPU_CLOCK_HZ: u32 = 4_194_304;
 const OUTPUT_SAMPLE_RATE: u32 = 48_000;
+const DC_BLOCK_COEFF: f32 = 0.996;
 const DUTY_PATTERNS: [u8; 4] = [0b0000_0001, 0b1000_0001, 0b1000_0111, 0b0111_1110];
 const NOISE_DIVISORS: [u16; 8] = [8, 16, 32, 48, 64, 80, 96, 112];
 
@@ -60,6 +61,10 @@ struct Channel {
     period_timer: u16,
     phase: u8,
     volume: u8,
+    initial_volume: u8,
+    envelope_period: u8,
+    envelope_timer: u8,
+    envelope_increase: bool,
     lfsr: u16,
 }
 
@@ -74,6 +79,10 @@ impl Channel {
             period_timer: 0,
             phase: 0,
             volume: 0,
+            initial_volume: 0,
+            envelope_period: 0,
+            envelope_timer: 0,
+            envelope_increase: false,
             lfsr: 0x7fff,
         }
     }
@@ -88,6 +97,10 @@ impl Channel {
         }
         self.enabled = self.dac_enabled;
         self.phase = 0;
+        self.period_timer = 0;
+        self.volume = self.initial_volume;
+        self.envelope_timer = self.envelope_period.max(1);
+        self.lfsr = 0x7fff;
     }
 
     fn clock_length(&mut self) {
@@ -97,6 +110,53 @@ impl Channel {
         self.length_counter -= 1;
         if self.length_counter == 0 {
             self.enabled = false;
+        }
+    }
+
+    fn clock_envelope(&mut self) {
+        if !self.enabled || self.envelope_period == 0 {
+            return;
+        }
+
+        if self.envelope_timer > 0 {
+            self.envelope_timer -= 1;
+        }
+        if self.envelope_timer != 0 {
+            return;
+        }
+
+        self.envelope_timer = self.envelope_period;
+        if self.envelope_increase {
+            if self.volume < 15 {
+                self.volume += 1;
+            }
+        } else if self.volume > 0 {
+            self.volume -= 1;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SweepState {
+    enabled: bool,
+    timer: u8,
+    period: u8,
+    shift: u8,
+    negate: bool,
+    negate_used: bool,
+    shadow_freq: u16,
+}
+
+impl SweepState {
+    fn new() -> Self {
+        Self {
+            enabled: false,
+            timer: 8,
+            period: 0,
+            shift: 0,
+            negate: false,
+            negate_used: false,
+            shadow_freq: 0,
         }
     }
 }
@@ -111,8 +171,13 @@ pub struct Apu {
     ch2: Channel,
     ch3: Channel,
     ch4: Channel,
+    sweep: SweepState,
     sample_phase: u32,
     sample_buffer: Vec<i16>,
+    hp_prev_in_l: f32,
+    hp_prev_in_r: f32,
+    hp_prev_out_l: f32,
+    hp_prev_out_r: f32,
 }
 
 impl Apu {
@@ -127,8 +192,13 @@ impl Apu {
             ch2: Channel::new(64),
             ch3: Channel::new(256),
             ch4: Channel::new(64),
+            sweep: SweepState::new(),
             sample_phase: 0,
             sample_buffer: Vec::new(),
+            hp_prev_in_l: 0.0,
+            hp_prev_in_r: 0.0,
+            hp_prev_out_l: 0.0,
+            hp_prev_out_r: 0.0,
         }
     }
 
@@ -193,7 +263,7 @@ impl Apu {
         self.sample_phase += u32::from(cycles) * OUTPUT_SAMPLE_RATE;
         while self.sample_phase >= CPU_CLOCK_HZ {
             self.sample_phase -= CPU_CLOCK_HZ;
-            let (left, right) = self.mix_sample();
+            let (left, right) = self.render_sample();
             self.sample_buffer.push(left);
             self.sample_buffer.push(right);
         }
@@ -216,7 +286,12 @@ impl Apu {
         self.ch2 = Channel::new(64);
         self.ch3 = Channel::new(256);
         self.ch4 = Channel::new(64);
+        self.sweep = SweepState::new();
         self.sample_phase = 0;
+        self.hp_prev_in_l = 0.0;
+        self.hp_prev_in_r = 0.0;
+        self.hp_prev_out_l = 0.0;
+        self.hp_prev_out_r = 0.0;
     }
 
     fn power_on(&mut self) {
@@ -242,7 +317,11 @@ impl Apu {
             NR12 => {
                 self.write_reg_raw(addr, value);
                 self.ch1.dac_enabled = value & 0xf8 != 0;
-                self.ch1.volume = value >> 4;
+                self.ch1.initial_volume = value >> 4;
+                self.ch1.volume = self.ch1.initial_volume;
+                self.ch1.envelope_increase = value & 0x08 != 0;
+                self.ch1.envelope_period = value & 0x07;
+                self.ch1.envelope_timer = self.ch1.envelope_period.max(1);
                 if !self.ch1.dac_enabled {
                     self.ch1.enabled = false;
                 }
@@ -252,6 +331,7 @@ impl Apu {
                 self.ch1.length_enabled = value & 0x40 != 0;
                 if value & 0x80 != 0 {
                     self.ch1.trigger();
+                    self.trigger_sweep();
                 }
             }
             NR21 => {
@@ -261,7 +341,11 @@ impl Apu {
             NR22 => {
                 self.write_reg_raw(addr, value);
                 self.ch2.dac_enabled = value & 0xf8 != 0;
-                self.ch2.volume = value >> 4;
+                self.ch2.initial_volume = value >> 4;
+                self.ch2.volume = self.ch2.initial_volume;
+                self.ch2.envelope_increase = value & 0x08 != 0;
+                self.ch2.envelope_period = value & 0x07;
+                self.ch2.envelope_timer = self.ch2.envelope_period.max(1);
                 if !self.ch2.dac_enabled {
                     self.ch2.enabled = false;
                 }
@@ -298,7 +382,11 @@ impl Apu {
             NR42 => {
                 self.write_reg_raw(addr, value);
                 self.ch4.dac_enabled = value & 0xf8 != 0;
-                self.ch4.volume = value >> 4;
+                self.ch4.initial_volume = value >> 4;
+                self.ch4.volume = self.ch4.initial_volume;
+                self.ch4.envelope_increase = value & 0x08 != 0;
+                self.ch4.envelope_period = value & 0x07;
+                self.ch4.envelope_timer = self.ch4.envelope_period.max(1);
                 if !self.ch4.dac_enabled {
                     self.ch4.enabled = false;
                 }
@@ -321,6 +409,14 @@ impl Apu {
             self.ch2.clock_length();
             self.ch3.clock_length();
             self.ch4.clock_length();
+        }
+        if self.frame_seq_step == 2 || self.frame_seq_step == 6 {
+            self.clock_sweep();
+        }
+        if self.frame_seq_step == 7 {
+            self.ch1.clock_envelope();
+            self.ch2.clock_envelope();
+            self.ch4.clock_envelope();
         }
     }
 
@@ -414,7 +510,74 @@ impl Apu {
         divisor << shift
     }
 
-    fn mix_sample(&self) -> (i16, i16) {
+    fn trigger_sweep(&mut self) {
+        let nr10 = self.regs[Self::reg_index(NR10)];
+        self.sweep.period = (nr10 >> 4) & 0x07;
+        self.sweep.shift = nr10 & 0x07;
+        self.sweep.negate = nr10 & 0x08 != 0;
+        self.sweep.timer = self.sweep.period.max(1);
+        self.sweep.shadow_freq = self.square_freq(
+            self.regs[Self::reg_index(NR13)],
+            self.regs[Self::reg_index(NR14)],
+        );
+        self.sweep.enabled = self.sweep.period != 0 || self.sweep.shift != 0;
+        if self.sweep.shift != 0 {
+            let _ = self.calculate_sweep_frequency(false);
+        }
+    }
+
+    fn clock_sweep(&mut self) {
+        if self.sweep.timer > 0 {
+            self.sweep.timer -= 1;
+        }
+        if self.sweep.timer != 0 {
+            return;
+        }
+
+        self.sweep.timer = self.sweep.period.max(1);
+        if !self.sweep.enabled || self.sweep.period == 0 {
+            return;
+        }
+        if let Some(new_freq) = self.calculate_sweep_frequency(true) {
+            if self.sweep.shift != 0 {
+                self.sweep.shadow_freq = new_freq;
+                self.set_square1_freq(new_freq);
+                let _ = self.calculate_sweep_frequency(false);
+            }
+        }
+    }
+
+    fn calculate_sweep_frequency(&mut self, update_negate_used: bool) -> Option<u16> {
+        let delta = self.sweep.shadow_freq >> self.sweep.shift;
+        let new_freq = if self.sweep.negate {
+            if update_negate_used {
+                self.sweep.negate_used = true;
+            }
+            self.sweep.shadow_freq.wrapping_sub(delta)
+        } else {
+            self.sweep.shadow_freq.saturating_add(delta)
+        };
+
+        if new_freq > 0x07ff {
+            self.ch1.enabled = false;
+            return None;
+        }
+        Some(new_freq)
+    }
+
+    fn square_freq(&self, lo: u8, hi: u8) -> u16 {
+        (((hi as u16) & 0x07) << 8) | lo as u16
+    }
+
+    fn set_square1_freq(&mut self, freq: u16) {
+        let lo_idx = Self::reg_index(NR13);
+        let hi_idx = Self::reg_index(NR14);
+        self.regs[lo_idx] = (freq & 0xff) as u8;
+        self.regs[hi_idx] = (self.regs[hi_idx] & !0x07) | (((freq >> 8) as u8) & 0x07);
+        self.ch1.period_timer = 0;
+    }
+
+    fn render_sample(&mut self) -> (i16, i16) {
         let nr50 = self.regs[Self::reg_index(NR50)];
         let nr51 = self.regs[Self::reg_index(NR51)];
         let left_volume = ((nr50 >> 4) & 0x07) + 1;
@@ -438,12 +601,28 @@ impl Apu {
             }
         }
 
-        let left = (left * (left_volume as f32 / 8.0) / 4.0).clamp(-1.0, 1.0);
-        let right = (right * (right_volume as f32 / 8.0) / 4.0).clamp(-1.0, 1.0);
+        let left = left * (left_volume as f32 / 8.0) / 5.0;
+        let right = right * (right_volume as f32 / 8.0) / 5.0;
+        let left = self.high_pass_left(left).clamp(-1.0, 1.0);
+        let right = self.high_pass_right(right).clamp(-1.0, 1.0);
         (
             (left * i16::MAX as f32) as i16,
             (right * i16::MAX as f32) as i16,
         )
+    }
+
+    fn high_pass_left(&mut self, input: f32) -> f32 {
+        let output = input - self.hp_prev_in_l + DC_BLOCK_COEFF * self.hp_prev_out_l;
+        self.hp_prev_in_l = input;
+        self.hp_prev_out_l = output;
+        output
+    }
+
+    fn high_pass_right(&mut self, input: f32) -> f32 {
+        let output = input - self.hp_prev_in_r + DC_BLOCK_COEFF * self.hp_prev_out_r;
+        self.hp_prev_in_r = input;
+        self.hp_prev_out_r = output;
+        output
     }
 
     fn square_sample(&self, ch: &Channel, duty_reg: u8) -> f32 {
@@ -595,5 +774,22 @@ mod tests {
         assert!(!samples.is_empty());
         assert_eq!(samples.len() % 2, 0);
         assert!(samples.iter().any(|&sample| sample != 0));
+    }
+
+    #[test]
+    fn envelope_clocks_channel_volume_down() {
+        let mut apu = Apu::new();
+        apu.write(NR52, 0x80);
+        apu.write(NR12, 0x51);
+        apu.write(NR11, 0x80);
+        apu.write(NR14, 0x80);
+
+        assert_eq!(apu.ch1.volume, 5);
+        for _ in 0..7 {
+            for _ in 0..(FRAME_SEQ_PERIOD_T / 4) {
+                apu.tick(4);
+            }
+        }
+        assert_eq!(apu.ch1.volume, 4);
     }
 }
