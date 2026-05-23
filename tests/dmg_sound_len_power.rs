@@ -24,7 +24,8 @@ fn post_boot_cpu() -> Cpu {
 
 #[test]
 fn dmg_sound_08_len_ctr_during_power_reaches_pass_result() {
-    let rom_path = Path::new("test-rom/gb-test-roms/dmg_sound/rom_singles/08-len ctr during power.gb");
+    let rom_path =
+        Path::new("test-rom/gb-test-roms/dmg_sound/rom_singles/08-len ctr during power.gb");
     if !rom_path.exists() {
         eprintln!(
             "skipping dmg_sound 08-len ctr during power regression: drop the ROM at {} to enable it",

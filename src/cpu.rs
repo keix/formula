@@ -292,7 +292,11 @@ impl Cpu {
         self.f.set_n(false);
         self.f.set_h((v & 0xf) == 0xf);
         // C unchanged
-        if idx == 6 { 12 } else { 4 }
+        if idx == 6 {
+            12
+        } else {
+            4
+        }
     }
 
     fn dec_r(&mut self, idx: u8, bus: &mut impl Bus) -> u8 {
@@ -303,7 +307,11 @@ impl Cpu {
         self.f.set_n(true);
         self.f.set_h((v & 0xf) == 0);
         // C unchanged
-        if idx == 6 { 12 } else { 4 }
+        if idx == 6 {
+            12
+        } else {
+            4
+        }
     }
 
     fn add_hl(&mut self, value: u16) {
@@ -525,24 +533,40 @@ impl Cpu {
                     _ => unreachable!(),
                 };
                 self.write_r(src, result, bus);
-                if src == 6 { 16 } else { 8 }
+                if src == 6 {
+                    16
+                } else {
+                    8
+                }
             }
             0x40..=0x7f => {
                 let bit = (opcode >> 3) & 7;
                 self.f.set_z(value & (1 << bit) == 0);
                 self.f.set_n(false);
                 self.f.set_h(true);
-                if src == 6 { 12 } else { 8 }
+                if src == 6 {
+                    12
+                } else {
+                    8
+                }
             }
             0x80..=0xbf => {
                 let bit = (opcode >> 3) & 7;
                 self.write_r(src, value & !(1 << bit), bus);
-                if src == 6 { 16 } else { 8 }
+                if src == 6 {
+                    16
+                } else {
+                    8
+                }
             }
             0xc0..=0xff => {
                 let bit = (opcode >> 3) & 7;
                 self.write_r(src, value | (1 << bit), bus);
-                if src == 6 { 16 } else { 8 }
+                if src == 6 {
+                    16
+                } else {
+                    8
+                }
             }
         }
     }
@@ -907,7 +931,11 @@ impl Cpu {
                 let src = opcode & 7;
                 let value = self.read_r(src, bus);
                 self.write_r(dst, value, bus);
-                if dst == 6 || src == 6 { 8 } else { 4 }
+                if dst == 6 || src == 6 {
+                    8
+                } else {
+                    4
+                }
             }
             0x80..=0xbf => {
                 let op = (opcode >> 3) & 7;
@@ -924,7 +952,11 @@ impl Cpu {
                     7 => self.cp_a(value),
                     _ => unreachable!(),
                 }
-                if src == 6 { 8 } else { 4 }
+                if src == 6 {
+                    8
+                } else {
+                    4
+                }
             }
             0xc0 => self.ret_cc(0, bus), // RET NZ
             0xc1 => {

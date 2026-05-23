@@ -235,6 +235,14 @@ impl Mmu {
         self.ppu.framebuffer()
     }
 
+    pub fn audio_sample_rate(&self) -> u32 {
+        self.apu.sample_rate()
+    }
+
+    pub fn drain_audio_samples(&mut self) -> Vec<i16> {
+        self.apu.drain_samples()
+    }
+
     fn write8_cpu_impl(&mut self, addr: u16, value: u8) {
         self.write8(addr, value);
     }
@@ -652,7 +660,7 @@ mod tests {
     fn stat_interrupt_propagates_to_if_bit_1() {
         let mut mmu = make_mmu();
         mmu.write8(0xff40, 0x80); // enable LCD
-        // Enable LYC source with LYC = LY = 0; first PPU tick raises the line.
+                                  // Enable LYC source with LYC = LY = 0; first PPU tick raises the line.
         mmu.write8(0xff45, 0);
         mmu.write8(0xff41, 0b0100_0000);
 

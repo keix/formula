@@ -25,7 +25,7 @@ use formula::ppu::{HEIGHT, WIDTH};
 use minifb::{Key, KeyRepeat, Scale, Window, WindowOptions};
 use std::env;
 use std::io::Write;
-use std::process::ExitCode;
+use std::process::{Child, ChildStdin, Command, ExitCode, Stdio};
 
 // Safety net so a runaway ROM eventually returns control instead of hanging
 // the terminal. Generous enough for Blargg's cpu_instrs to finish even
@@ -34,6 +34,50 @@ const MAX_CYCLES: u64 = 2_000_000_000;
 
 // DMG-style green palette, lightest -> darkest.
 const PALETTE: [u32; 4] = [0x9bbc0f, 0x8bac0f, 0x306230, 0x0f380f];
+
+struct AudioSink {
+    _child: Child,
+    stdin: ChildStdin,
+}
+
+impl AudioSink {
+    fn spawn(sample_rate: u32) -> Option<Self> {
+        let mut child = Command::new("aplay")
+            .args([
+                "-q",
+                "-t",
+                "raw",
+                "-f",
+                "S16_LE",
+                "-c",
+                "2",
+                "-r",
+                &sample_rate.to_string(),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let stdin = child.stdin.take()?;
+        Some(Self {
+            _child: child,
+            stdin,
+        })
+    }
+
+    fn write_samples(&mut self, samples: &[i16]) {
+        if samples.is_empty() {
+            return;
+        }
+
+        let mut bytes = Vec::with_capacity(samples.len() * 2);
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        let _ = self.stdin.write_all(&bytes);
+    }
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -89,6 +133,7 @@ fn main() -> ExitCode {
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
     let mut pixel_buffer: Vec<u32> = vec![0; WIDTH * HEIGHT];
+    let mut audio = AudioSink::spawn(mmu.audio_sample_rate());
     let mut total_cycles: u64 = 0;
     let mut parked = false;
     let mut same_pc_count: u32 = 0;
@@ -110,6 +155,10 @@ fn main() -> ExitCode {
         if !out.is_empty() {
             let _ = stdout.write_all(&out);
             let _ = stdout.flush();
+        }
+        if let Some(audio) = audio.as_mut() {
+            let samples = mmu.drain_audio_samples();
+            audio.write_samples(&samples);
         }
 
         if mmu.take_frame_ready() {

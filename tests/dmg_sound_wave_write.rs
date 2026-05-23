@@ -24,7 +24,8 @@ fn post_boot_cpu() -> Cpu {
 
 #[test]
 fn dmg_sound_12_wave_write_while_on_reaches_pass_result() {
-    let rom_path = Path::new("test-rom/gb-test-roms/dmg_sound/rom_singles/12-wave write while on.gb");
+    let rom_path =
+        Path::new("test-rom/gb-test-roms/dmg_sound/rom_singles/12-wave write while on.gb");
     if !rom_path.exists() {
         eprintln!(
             "skipping dmg_sound 12-wave write while on regression: drop the ROM at {} to enable it",

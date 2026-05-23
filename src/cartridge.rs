@@ -318,7 +318,7 @@ mod tests {
         let mut cart = Mbc1::new(mbc1_rom(128, 0));
         cart.write_rom(0x4000, 0x01); // bank_hi = 1
         cart.write_rom(0x6000, 0x01); // mode = 1
-        // Low window now sees bank (1 << 5) = 32.
+                                      // Low window now sees bank (1 << 5) = 32.
         assert_eq!(cart.read_rom(0x0000), 32);
         // High window: (1 << 5) | bank_lo(1) = 33.
         assert_eq!(cart.read_rom(0x4000), 33);

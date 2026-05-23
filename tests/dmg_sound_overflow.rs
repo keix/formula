@@ -24,7 +24,8 @@ fn post_boot_cpu() -> Cpu {
 
 #[test]
 fn dmg_sound_06_overflow_on_trigger_reaches_pass_result() {
-    let rom_path = Path::new("test-rom/gb-test-roms/dmg_sound/rom_singles/06-overflow on trigger.gb");
+    let rom_path =
+        Path::new("test-rom/gb-test-roms/dmg_sound/rom_singles/06-overflow on trigger.gb");
     if !rom_path.exists() {
         eprintln!(
             "skipping dmg_sound 06-overflow on trigger regression: drop the ROM at {} to enable it",

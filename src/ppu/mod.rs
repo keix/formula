@@ -1158,7 +1158,7 @@ mod tests {
                 | LCDC_WINDOW_TILE_MAP,
         );
         ppu.write(0xff47, 0xe4); // identity BGP
-        // BG tile 0 -> color 1 (so the window's color 3 stands out on top).
+                                 // BG tile 0 -> color 1 (so the window's color 3 stands out on top).
         for offset in 0..16 {
             ppu.write_vram(0x8000 + offset, if offset % 2 == 0 { 0xff } else { 0x00 });
         }
@@ -1320,8 +1320,8 @@ mod tests {
         ppu.write(0xff47, 0xe4); // BGP identity
         ppu.write(0xff48, 0xe4); // OBP0 identity
         ppu.write(0xff49, 0xe4); // OBP1 identity
-        // Sprite tile at index 1: row 0 has pixel 0 = color 3, others = 0.
-        // bytes [0]=0x80 [1]=0x80 in tile 1 -> bit 7 is 1 in both planes -> color 3
+                                 // Sprite tile at index 1: row 0 has pixel 0 = color 3, others = 0.
+                                 // bytes [0]=0x80 [1]=0x80 in tile 1 -> bit 7 is 1 in both planes -> color 3
         ppu.write_vram(0x8010, 0x80);
         ppu.write_vram(0x8011, 0x80);
         ppu

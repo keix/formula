@@ -1,10 +1,12 @@
-//! DMG APU register file and coarse frame-sequencer state.
+//! DMG APU register file, coarse frame sequencer, and a first-pass mixer.
 //!
 //! This models the CPU-visible behavior needed by the early Blargg sound
 //! ROMs: register read masks, NR52 power control, wave RAM, channel status
 //! bits, and the 256 Hz length counters driven by the 512 Hz frame
-//! sequencer. Audio generation, envelopes, sweep, and wave playback timing
-//! are layered on later.
+//! sequencer. It also exposes a pragmatic first audio path: basic square,
+//! wave, and noise generation using the register file's current state,
+//! mixed down to interleaved stereo `i16` samples. Envelope/sweep timing
+//! is still incomplete, but commercial ROMs can now produce audible output.
 
 const REG_START: u16 = 0xff10;
 const REG_END: u16 = 0xff26;
@@ -13,15 +15,20 @@ const WAVE_END: u16 = 0xff3f;
 
 const NR10: u16 = 0xff10;
 const NR11: u16 = 0xff11;
+const NR13: u16 = 0xff13;
 const NR12: u16 = 0xff12;
 const NR14: u16 = 0xff14;
 const NR21: u16 = 0xff16;
+const NR23: u16 = 0xff18;
 const NR22: u16 = 0xff17;
 const NR24: u16 = 0xff19;
 const NR30: u16 = 0xff1a;
 const NR31: u16 = 0xff1b;
+const NR32: u16 = 0xff1c;
+const NR33: u16 = 0xff1d;
 const NR34: u16 = 0xff1e;
 const NR41: u16 = 0xff20;
+const NR43: u16 = 0xff22;
 const NR42: u16 = 0xff21;
 const NR44: u16 = 0xff23;
 const NR50: u16 = 0xff24;
@@ -34,10 +41,14 @@ const READ_MASKS: [u8; (REG_END - REG_START + 1) as usize] = [
     0xff, 0x3f, 0x00, 0xff, 0xbf, // FF15-FF19
     0x7f, 0xff, 0x9f, 0xff, 0xbf, // FF1A-FF1E
     0xff, 0xff, 0x00, 0x00, 0xbf, // FF1F-FF23
-    0x00, 0x00, 0x70,             // FF24-FF26
+    0x00, 0x00, 0x70, // FF24-FF26
 ];
 
 const FRAME_SEQ_PERIOD_T: u16 = 8192;
+const CPU_CLOCK_HZ: u32 = 4_194_304;
+const OUTPUT_SAMPLE_RATE: u32 = 48_000;
+const DUTY_PATTERNS: [u8; 4] = [0b0000_0001, 0b1000_0001, 0b1000_0111, 0b0111_1110];
+const NOISE_DIVISORS: [u16; 8] = [8, 16, 32, 48, 64, 80, 96, 112];
 
 #[derive(Clone, Copy)]
 struct Channel {
@@ -46,6 +57,10 @@ struct Channel {
     length_enabled: bool,
     length_counter: u16,
     max_length: u16,
+    period_timer: u16,
+    phase: u8,
+    volume: u8,
+    lfsr: u16,
 }
 
 impl Channel {
@@ -56,6 +71,10 @@ impl Channel {
             length_enabled: false,
             length_counter: 0,
             max_length,
+            period_timer: 0,
+            phase: 0,
+            volume: 0,
+            lfsr: 0x7fff,
         }
     }
 
@@ -68,6 +87,7 @@ impl Channel {
             self.length_counter = self.max_length;
         }
         self.enabled = self.dac_enabled;
+        self.phase = 0;
     }
 
     fn clock_length(&mut self) {
@@ -91,6 +111,8 @@ pub struct Apu {
     ch2: Channel,
     ch3: Channel,
     ch4: Channel,
+    sample_phase: u32,
+    sample_buffer: Vec<i16>,
 }
 
 impl Apu {
@@ -105,6 +127,8 @@ impl Apu {
             ch2: Channel::new(64),
             ch3: Channel::new(256),
             ch4: Channel::new(64),
+            sample_phase: 0,
+            sample_buffer: Vec::new(),
         }
     }
 
@@ -158,11 +182,29 @@ impl Apu {
             return;
         }
 
+        self.advance_channels(cycles);
+
         self.frame_seq_div += u16::from(cycles);
         while self.frame_seq_div >= FRAME_SEQ_PERIOD_T {
             self.frame_seq_div -= FRAME_SEQ_PERIOD_T;
             self.clock_frame_sequencer();
         }
+
+        self.sample_phase += u32::from(cycles) * OUTPUT_SAMPLE_RATE;
+        while self.sample_phase >= CPU_CLOCK_HZ {
+            self.sample_phase -= CPU_CLOCK_HZ;
+            let (left, right) = self.mix_sample();
+            self.sample_buffer.push(left);
+            self.sample_buffer.push(right);
+        }
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        OUTPUT_SAMPLE_RATE
+    }
+
+    pub fn drain_samples(&mut self) -> Vec<i16> {
+        std::mem::take(&mut self.sample_buffer)
     }
 
     fn power_off(&mut self) {
@@ -174,6 +216,7 @@ impl Apu {
         self.ch2 = Channel::new(64);
         self.ch3 = Channel::new(256);
         self.ch4 = Channel::new(64);
+        self.sample_phase = 0;
     }
 
     fn power_on(&mut self) {
@@ -199,6 +242,7 @@ impl Apu {
             NR12 => {
                 self.write_reg_raw(addr, value);
                 self.ch1.dac_enabled = value & 0xf8 != 0;
+                self.ch1.volume = value >> 4;
                 if !self.ch1.dac_enabled {
                     self.ch1.enabled = false;
                 }
@@ -217,6 +261,7 @@ impl Apu {
             NR22 => {
                 self.write_reg_raw(addr, value);
                 self.ch2.dac_enabled = value & 0xf8 != 0;
+                self.ch2.volume = value >> 4;
                 if !self.ch2.dac_enabled {
                     self.ch2.enabled = false;
                 }
@@ -253,6 +298,7 @@ impl Apu {
             NR42 => {
                 self.write_reg_raw(addr, value);
                 self.ch4.dac_enabled = value & 0xf8 != 0;
+                self.ch4.volume = value >> 4;
                 if !self.ch4.dac_enabled {
                     self.ch4.enabled = false;
                 }
@@ -276,6 +322,172 @@ impl Apu {
             self.ch3.clock_length();
             self.ch4.clock_length();
         }
+    }
+
+    fn advance_channels(&mut self, cycles: u8) {
+        self.advance_square(1, cycles);
+        self.advance_square(2, cycles);
+        self.advance_wave(cycles);
+        self.advance_noise(cycles);
+    }
+
+    fn advance_square(&mut self, channel: u8, cycles: u8) {
+        let (ch, lo_reg, hi_reg) = match channel {
+            1 => (&mut self.ch1, NR13, NR14),
+            2 => (&mut self.ch2, NR23, NR24),
+            _ => unreachable!(),
+        };
+        if !ch.enabled {
+            return;
+        }
+
+        let period = Self::square_period(
+            self.regs[Self::reg_index(lo_reg)],
+            self.regs[Self::reg_index(hi_reg)],
+        );
+        Self::advance_periodic_channel(ch, cycles, period);
+    }
+
+    fn advance_wave(&mut self, cycles: u8) {
+        if !self.ch3.enabled {
+            return;
+        }
+        let period = Self::wave_period(
+            self.regs[Self::reg_index(NR33)],
+            self.regs[Self::reg_index(NR34)],
+        );
+        Self::advance_periodic_channel(&mut self.ch3, cycles, period);
+    }
+
+    fn advance_noise(&mut self, cycles: u8) {
+        if !self.ch4.enabled {
+            return;
+        }
+
+        let period = Self::noise_period(self.regs[Self::reg_index(NR43)]);
+        let mut remaining = u16::from(cycles);
+        while remaining > 0 {
+            if self.ch4.period_timer == 0 {
+                self.ch4.period_timer = period;
+            }
+            let step = remaining.min(self.ch4.period_timer);
+            self.ch4.period_timer -= step;
+            remaining -= step;
+            if self.ch4.period_timer == 0 {
+                let xor = ((self.ch4.lfsr & 0x01) ^ ((self.ch4.lfsr >> 1) & 0x01)) as u16;
+                self.ch4.lfsr = (self.ch4.lfsr >> 1) | (xor << 14);
+                if self.regs[Self::reg_index(NR43)] & 0x08 != 0 {
+                    self.ch4.lfsr = (self.ch4.lfsr & !(1 << 6)) | (xor << 6);
+                }
+            }
+        }
+    }
+
+    fn advance_periodic_channel(ch: &mut Channel, cycles: u8, period: u16) {
+        let mut remaining = u16::from(cycles);
+        while remaining > 0 {
+            if ch.period_timer == 0 {
+                ch.period_timer = period;
+            }
+            let step = remaining.min(ch.period_timer);
+            ch.period_timer -= step;
+            remaining -= step;
+            if ch.period_timer == 0 {
+                ch.phase = ch.phase.wrapping_add(1);
+            }
+        }
+    }
+
+    fn square_period(lo: u8, hi: u8) -> u16 {
+        let freq = (((hi as u16) & 0x07) << 8) | lo as u16;
+        ((2048 - freq).max(1)) * 4
+    }
+
+    fn wave_period(lo: u8, hi: u8) -> u16 {
+        let freq = (((hi as u16) & 0x07) << 8) | lo as u16;
+        ((2048 - freq).max(1)) * 2
+    }
+
+    fn noise_period(nr43: u8) -> u16 {
+        let shift = nr43 >> 4;
+        let divisor = NOISE_DIVISORS[(nr43 & 0x07) as usize];
+        divisor << shift
+    }
+
+    fn mix_sample(&self) -> (i16, i16) {
+        let nr50 = self.regs[Self::reg_index(NR50)];
+        let nr51 = self.regs[Self::reg_index(NR51)];
+        let left_volume = ((nr50 >> 4) & 0x07) + 1;
+        let right_volume = (nr50 & 0x07) + 1;
+
+        let channel_samples = [
+            self.square_sample(&self.ch1, self.regs[Self::reg_index(NR11)]),
+            self.square_sample(&self.ch2, self.regs[Self::reg_index(NR21)]),
+            self.wave_sample(),
+            self.noise_sample(),
+        ];
+
+        let mut left = 0.0f32;
+        let mut right = 0.0f32;
+        for (idx, sample) in channel_samples.into_iter().enumerate() {
+            if nr51 & (1 << (idx + 4)) != 0 {
+                left += sample;
+            }
+            if nr51 & (1 << idx) != 0 {
+                right += sample;
+            }
+        }
+
+        let left = (left * (left_volume as f32 / 8.0) / 4.0).clamp(-1.0, 1.0);
+        let right = (right * (right_volume as f32 / 8.0) / 4.0).clamp(-1.0, 1.0);
+        (
+            (left * i16::MAX as f32) as i16,
+            (right * i16::MAX as f32) as i16,
+        )
+    }
+
+    fn square_sample(&self, ch: &Channel, duty_reg: u8) -> f32 {
+        if !ch.enabled || !ch.dac_enabled || ch.volume == 0 {
+            return 0.0;
+        }
+        let duty = DUTY_PATTERNS[((duty_reg >> 6) & 0x03) as usize];
+        let high = (duty >> (7 - (ch.phase & 0x07))) & 0x01 != 0;
+        let amp = if high { 1.0 } else { -1.0 };
+        amp * (ch.volume as f32 / 15.0)
+    }
+
+    fn wave_sample(&self) -> f32 {
+        if !self.ch3.enabled || !self.ch3.dac_enabled {
+            return 0.0;
+        }
+
+        let level_code = (self.regs[Self::reg_index(NR32)] >> 5) & 0x03;
+        if level_code == 0 {
+            return 0.0;
+        }
+
+        let sample_index = (self.ch3.phase & 0x1f) as usize;
+        let byte = self.wave_ram[sample_index / 2];
+        let nibble = if sample_index & 1 == 0 {
+            byte >> 4
+        } else {
+            byte & 0x0f
+        };
+        let shifted = match level_code {
+            1 => nibble,
+            2 => nibble >> 1,
+            3 => nibble >> 2,
+            _ => 0,
+        };
+        (shifted as f32 / 7.5) - 1.0
+    }
+
+    fn noise_sample(&self) -> f32 {
+        if !self.ch4.enabled || !self.ch4.dac_enabled || self.ch4.volume == 0 {
+            return 0.0;
+        }
+        let amp = if self.ch4.lfsr & 0x01 == 0 { 1.0 } else { -1.0 };
+        amp * (self.ch4.volume as f32 / 15.0)
     }
 }
 
@@ -364,5 +576,24 @@ mod tests {
         apu.write(NR22, 0x07);
 
         assert_eq!(apu.read(NR52) & 0x02, 0x00);
+    }
+
+    #[test]
+    fn ticking_produces_stereo_samples_when_a_channel_is_routed() {
+        let mut apu = Apu::new();
+        apu.write(NR52, 0x80);
+        apu.write(NR50, 0x77);
+        apu.write(NR51, 0x11);
+        apu.write(NR12, 0xf0);
+        apu.write(NR11, 0x80);
+        apu.write(NR13, 0xaa);
+        apu.write(NR14, 0x87);
+
+        apu.tick(128);
+        let samples = apu.drain_samples();
+
+        assert!(!samples.is_empty());
+        assert_eq!(samples.len() % 2, 0);
+        assert!(samples.iter().any(|&sample| sample != 0));
     }
 }
