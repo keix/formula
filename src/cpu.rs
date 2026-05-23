@@ -39,6 +39,11 @@ pub struct Cpu {
     pub halt_bug: bool,
     pub locked: bool,
     ime_delay: u8,
+    // Set on the M-cycle HALT was decoded; the first halted iteration ticks
+    // 4 cycles without a mid-cycle pending check, matching SameBoy's
+    // `just_halted` semantics. Subsequent halted iterations split into
+    // 2 + check + 2 so the wake can land mid-M-cycle, like real DMG.
+    just_halted: bool,
 }
 
 impl Cpu {
@@ -57,6 +62,7 @@ impl Cpu {
             halted: false,
             ime: false,
             halt_bug: false,
+            just_halted: false,
             locked: false,
             ime_delay: 0,
         }
@@ -608,13 +614,31 @@ impl Cpu {
         }
 
         if self.ime && pending != 0 {
+            self.just_halted = false;
             return self.service_interrupt(bus, pending);
         }
 
         if self.halted {
-            self.idle(bus);
+            // Real DMG splits halted M-cycles into two halves so a pending
+            // event raised at the half-cycle mark wakes the CPU 2 T-cycles
+            // earlier than a 4-cycle tick would allow. The first halted
+            // iteration (just after HALT decoded) stays at a single 4-cycle
+            // tick; from the next iteration onward we tick 2, re-sample
+            // the pending mask, and tick 2 more.
+            if self.just_halted {
+                self.idle(bus);
+                self.just_halted = false;
+            } else {
+                bus.tick(2);
+                let pending_mid = bus.read8(0xff0f) & bus.read8(0xffff) & 0x1f;
+                if pending_mid != 0 {
+                    self.halted = false;
+                }
+                bus.tick(2);
+            }
             return 4;
         }
+        self.just_halted = false;
 
         let opcode = self.fetch8(bus);
         let cycles = match opcode {
@@ -856,8 +880,16 @@ impl Cpu {
                 4
             }
             0x76 => {
-                // Re-sample IE & IF here: the opcode fetch above ticked the
-                // bus 4 cycles, which can have raised a new IF bit (timer
+                // Real DMG performs a CPU-side read at PC during HALT's M-
+                // cycle (SameBoy's halt() calls cycle_read(gb->pc) before
+                // the pending check). It does not advance time on its own
+                // — the opcode fetch above has already done the 4-cycle
+                // tick — but it does fire any address-bus side effects
+                // such as the OAM corruption bug.
+                let _ = bus.read8_cpu(self.pc);
+
+                // Re-sample IE & IF here: the opcode fetch ticked the bus
+                // 4 cycles, which can have raised a new IF bit (timer
                 // overflow, PPU mode transition, etc.). Blargg's halt_bug
                 // test cares about the pending state *at HALT execution*,
                 // not at the start of the step.
@@ -874,6 +906,7 @@ impl Cpu {
                     }
                 } else {
                     self.halted = true;
+                    self.just_halted = true;
                 }
                 4
             }
